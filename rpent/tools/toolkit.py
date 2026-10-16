@@ -185,6 +185,11 @@ class Toolkit:
     :meth:`close` to release robot-side primitives / servers at the end of the run.
     """
 
+    #: Active-time cap (s) for one state-changing tool call when
+    #: ``RPENT_TOOL_TIMEOUT_S`` is unset; 0 disables it. Robots whose skills run
+    #: longer by design set their own default.
+    default_tool_time_limit_s: float = 50.0
+
     def __init__(
         self,
         *,
@@ -281,7 +286,7 @@ class Toolkit:
         try:
             started = time.perf_counter()
             failed = False
-            time_limit_s = _tool_time_limit_s()
+            time_limit_s = _tool_time_limit_s(self.default_tool_time_limit_s)
             if time_limit_s > 0 and not _is_readonly(handler):
                 threading.Thread(
                     target=self._watch_tool_time,
@@ -437,16 +442,17 @@ class Toolkit:
         return None
 
 
-def _tool_time_limit_s() -> float:
+def _tool_time_limit_s(default: float = 50.0) -> float:
     """Active-time cap for one state-changing tool call (RPENT_TOOL_TIMEOUT_S).
 
-    Defaults to 50s so a stalled motion such as ``move_to`` is stopped and the
-    planner continues from the resulting state; 0 disables the cap.
+    Without the variable the toolkit's default applies: 50s for the base
+    toolkit, so a stalled motion such as ``move_to`` is stopped and the planner
+    continues from the resulting state. 0 disables the cap.
     """
     try:
-        return max(0.0, float(os.environ.get("RPENT_TOOL_TIMEOUT_S", "50")))
+        return max(0.0, float(os.environ.get("RPENT_TOOL_TIMEOUT_S", default)))
     except ValueError:
-        return 50.0
+        return default
 
 
 # RPENT_COERCE_TOOL_ARGS (opt-in; SGD_COERCE_TOOL_ARGS is accepted as an alias):

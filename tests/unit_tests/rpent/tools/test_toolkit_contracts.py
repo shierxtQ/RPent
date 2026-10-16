@@ -668,6 +668,40 @@ def test_tool_time_limit_excludes_perception_wait(
     assert toolkit.execute_tool("pi0_pick", {}).result == {"observation": 1}
 
 
+def test_toolkit_default_time_limit_applies_without_the_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RPENT_TOOL_TIMEOUT_S", raising=False)
+
+    class Uncapped(_ContractToolkit):
+        default_tool_time_limit_s = 0.0
+
+    class Capped(_ContractToolkit):
+        default_tool_time_limit_s = 0.3
+
+    uncapped = Uncapped(tmp_path / "uncapped")
+    uncapped.add_tool("rldx_skill", {"name": "rldx_skill"}, _slow_motion(uncapped, 0.6))
+    assert uncapped.execute_tool("rldx_skill", {}).result == {"observation": 1}
+
+    capped = Capped(tmp_path / "capped")
+    capped.add_tool("move_to", {"name": "move_to"}, _slow_motion(capped, 5))
+    assert capped.execute_tool("move_to", {}).result["code"] == "tool_timeout"
+
+
+def test_tool_time_limit_variable_overrides_the_toolkit_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_TOOL_TIMEOUT_S", "0.3")
+
+    class Uncapped(_ContractToolkit):
+        default_tool_time_limit_s = 0.0
+
+    toolkit = Uncapped(tmp_path)
+    toolkit.add_tool("rldx_skill", {"name": "rldx_skill"}, _slow_motion(toolkit, 5))
+
+    assert toolkit.execute_tool("rldx_skill", {}).result["code"] == "tool_timeout"
+
+
 def test_tool_time_limit_can_be_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

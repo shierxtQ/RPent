@@ -39,6 +39,13 @@ logger = get_logger("robocasa_toolkit")
 class RoboCasaToolkit(Toolkit):
     """Toolkit for the RoboCasa robot."""
 
+    # One rldx_skill / rldx_arm call runs RLDX until env success or
+    # RLDX_MAX_CHUNKS chunks (Target50: 40 chunks, settle patience 999, about
+    # 100s on a Jetson Orin), so the generic 50s cap would stop every skill
+    # halfway. The cell's planner timeout bounds the run instead;
+    # RPENT_TOOL_TIMEOUT_S still overrides this default.
+    default_tool_time_limit_s = 0.0
+
     def __init__(
         self,
         *,

@@ -26,7 +26,7 @@ from robots.robocasa import robot_spec, toolkit
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.memory import MemoryManager
 from rpent.robots import RunConfig
-from rpent.tools.toolkit import Toolkit, _is_readonly
+from rpent.tools.toolkit import Toolkit, _is_readonly, _tool_time_limit_s
 from rpent.utils import templates
 
 COMMON_TOOLS = {"read_text_file", "write_text_file", "list_dir", "finish"}
@@ -265,3 +265,14 @@ def test_exploration_recipe_exports_only_winning_attempt(tmp_path):
     assert [
         json.loads(line) for line in (tmp_path / name).read_text().splitlines()
     ] == [{"action": "move_delta"}]
+
+
+def test_rldx_skills_run_without_the_generic_tool_time_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RPENT_TOOL_TIMEOUT_S", raising=False)
+    default = toolkit.RoboCasaToolkit.default_tool_time_limit_s
+
+    assert _tool_time_limit_s(default) == 0.0
+    monkeypatch.setenv("RPENT_TOOL_TIMEOUT_S", "120")
+    assert _tool_time_limit_s(default) == 120.0
