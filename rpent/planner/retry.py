@@ -149,7 +149,9 @@ def retry_from_env(model: Model) -> Model:
 
 
 def unwrap_retry(model: Model) -> Model:
-    """Return the provider model under a :class:`RetryingModel`."""
-    while isinstance(model, RetryingModel):
+    """Return the provider model under retry and prompt-cache wrappers."""
+    from rpent.planner.prompt_cache import PromptCacheModel
+
+    while isinstance(model, (RetryingModel, PromptCacheModel)):
         model = model.wrapped
     return model

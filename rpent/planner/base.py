@@ -199,11 +199,16 @@ def build_planner(
 
     if planner_type == "api":
         from rpent.planner.api_loop import ApiAgentLoop
+        from rpent.planner.prompt_cache import prompt_cache_from_env
         from rpent.planner.retry import retry_from_env
 
         # Retries 429/5xx with backoff so a shared provider quota does not end
-        # the episode (RPENT_API_RETRIES=0 disables).
-        api_model = retry_from_env(build_api_model(model, base_url))
+        # the episode (RPENT_API_RETRIES=0 disables). OpenAI Responses models
+        # are streamed with a per-episode prompt_cache_key (RPENT_PROMPT_CACHE=0
+        # disables) so the gateway can serve the shared prefix from cache.
+        api_model = retry_from_env(
+            prompt_cache_from_env(build_api_model(model, base_url))
+        )
         # RPENT_ESCALATION=1 (opt-in): a senior model takes event-triggered turns.
         from rpent.planner.escalation import escalation_from_env
 

@@ -460,6 +460,7 @@ def escalation_from_env(
     if os.environ.get("RPENT_ESCALATION") != "1":
         return worker
     from rpent.planner.base import build_api_model
+    from rpent.planner.prompt_cache import prompt_cache_from_env
     from rpent.planner.retry import retry_from_env
 
     model_id = os.environ.get("RPENT_ESCALATION_MODEL")
@@ -470,10 +471,12 @@ def escalation_from_env(
             "credential named by RPENT_ESCALATION_KEY_ENV"
         )
     senior = retry_from_env(
-        build_api_model(
-            model_id,
-            os.environ.get("RPENT_ESCALATION_BASE_URL") or None,
-            api_key=os.environ[key_env],
+        prompt_cache_from_env(
+            build_api_model(
+                model_id,
+                os.environ.get("RPENT_ESCALATION_BASE_URL") or None,
+                api_key=os.environ[key_env],
+            )
         )
     )
     worker_settings: dict[str, Any] = {}
