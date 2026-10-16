@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from typing import Any
 
@@ -100,6 +101,112 @@ def test_stream_failure_is_retried_as_one_request() -> None:
 
     assert response.parts[0].content == "ok"
     assert attempts["n"] == 2
+
+
+def _sse(events: list[dict[str, Any]]) -> bytes:
+    return b"".join(
+        f"event: {e['type']}\ndata: {json.dumps({**e, 'sequence_number': i})}\n\n".encode()
+        for i, e in enumerate(events)
+    )
+
+
+def _function_call(n: int, arguments: str) -> dict[str, Any]:
+    return {
+        "type": "function_call",
+        "id": f"fc_{n}",
+        "call_id": f"call_{n}",
+        "name": "read_text_file",
+        "arguments": arguments,
+        "status": "completed",
+    }
+
+
+def test_parallel_tool_args_sent_only_on_done_are_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway stream: call 0 streams deltas, calls 1-2 only send ``done``."""
+    _no_proxy(monkeypatch)
+    import httpx2
+    from openai import AsyncOpenAI
+    from pydantic_ai.messages import ToolCallPart
+    from pydantic_ai.models.openai import OpenAIResponsesModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    paths = ["/a.txt", "/b.txt", "/c.txt"]
+    args = [json.dumps({"path": p}) for p in paths]
+    events: list[dict[str, Any]] = []
+    for n, arguments in enumerate(args):
+        events.append(
+            {
+                "type": "response.output_item.added",
+                "output_index": n,
+                "item": _function_call(n, ""),
+            }
+        )
+        if n == 0:
+            for piece in (arguments[:5], arguments[5:]):
+                events.append(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": "fc_0",
+                        "output_index": 0,
+                        "delta": piece,
+                    }
+                )
+        events.append(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": f"fc_{n}",
+                "output_index": n,
+                "arguments": arguments,
+            }
+        )
+        events.append(
+            {
+                "type": "response.output_item.done",
+                "output_index": n,
+                "item": _function_call(n, arguments),
+            }
+        )
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 0,
+                "model": "gpt-6-astra",
+                "status": "completed",
+                "output": [_function_call(n, a) for n, a in enumerate(args)],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            },
+        }
+    )
+    body = _sse(events)
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        assert json.loads(request.content)["stream"] is True
+        return httpx2.Response(
+            200, content=body, headers={"content-type": "text/event-stream"}
+        )
+
+    client = AsyncOpenAI(
+        base_url="http://gateway.test/v1",
+        api_key="test",
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    )
+    model = PromptCacheModel(
+        OpenAIResponsesModel(
+            "gpt-6-astra", provider=OpenAIProvider(openai_client=client)
+        )
+    )
+
+    response = _request(model)
+
+    calls = [p for p in response.parts if isinstance(p, ToolCallPart)]
+    assert [c.args_as_dict() for c in calls] == [{"path": p} for p in paths]
 
 
 def test_only_openai_responses_models_are_wrapped(
