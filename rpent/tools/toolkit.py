@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import re
 import threading
 import time
 import traceback
@@ -43,6 +45,8 @@ if TYPE_CHECKING:
 class _ToolOperation:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
+    #: Set by the tool-time watchdog before it requests cancellation.
+    timed_out: bool = False
 
 
 class ToolCancelled(Exception):
@@ -259,7 +263,11 @@ class Toolkit:
         entry = self._tools.get(name)
         if entry is None:
             return ToolResult(name=name, result={"error": f"unknown tool: {name}"})
-        _, handler = entry
+        spec, handler = entry
+        if _coerce_tool_args_enabled():
+            input_dict = _coerce_numeric_args(
+                input_dict, spec.get("input_schema") or {}
+            )
 
         with self._operation_lock:
             if self._active_operation is not None:
@@ -273,6 +281,14 @@ class Toolkit:
         try:
             started = time.perf_counter()
             failed = False
+            time_limit_s = _tool_time_limit_s()
+            if time_limit_s > 0 and not _is_readonly(handler):
+                threading.Thread(
+                    target=self._watch_tool_time,
+                    args=(operation, time_limit_s),
+                    name=f"tool-time-{name}",
+                    daemon=True,
+                ).start()
             try:
                 result = handler(**input_dict)
             except TypeError as e:
@@ -282,11 +298,22 @@ class Toolkit:
                 }
                 failed = True
             except ToolCancelled as e:
-                result = {
-                    "error": str(e),
-                    "code": "tool_cancelled",
-                    "interrupted": True,
-                }
+                if operation.timed_out:
+                    result = {
+                        "error": (
+                            f"{name} was stopped after {time_limit_s:g}s of execution "
+                            "(tool time limit); the state below is where it stopped. "
+                            "Continue from here."
+                        ),
+                        "code": "tool_timeout",
+                        "interrupted": True,
+                    }
+                else:
+                    result = {
+                        "error": str(e),
+                        "code": "tool_cancelled",
+                        "interrupted": True,
+                    }
                 failed = True
             except Exception as e:
                 result = {"error": str(e), "traceback": traceback.format_exc()}
@@ -348,6 +375,35 @@ class Toolkit:
     # Server lifecycle hooks (overridden by robot toolkits)
     # ------------------------------------------------------------------
 
+    def excluded_wait_s(self) -> float:
+        """Return optional local-resource wait excluded from active budgets."""
+        return 0.0
+
+    def resource_timing(self) -> dict[str, Any]:
+        """Return optional resource timing for the run transcript."""
+        return {}
+
+    def _watch_tool_time(self, operation: _ToolOperation, limit_s: float) -> None:
+        """Cancel ``operation`` once its active time exceeds ``limit_s``.
+
+        Shared-perception queue wait is excluded, like the planner budget. The
+        tool stops at its next safe cancellation boundary (each env step).
+        """
+        started = time.monotonic()
+        wait_started = self._excluded_wait_safe()
+        while not operation.done_event.wait(0.1):
+            waited = self._excluded_wait_safe() - wait_started
+            if time.monotonic() - started - waited >= limit_s:
+                operation.timed_out = True
+                operation.cancel_event.set()
+                return
+
+    def _excluded_wait_safe(self) -> float:
+        try:
+            return float(self.excluded_wait_s())
+        except Exception:
+            return 0.0
+
     def cancel_active_and_wait(self) -> None:
         """Request cancellation and wait for the active tool to return."""
         with self._operation_lock:
@@ -379,3 +435,76 @@ class Toolkit:
     def write_recipe(self, recipe_tag: str) -> str | None:
         """Write a replay recipe for this robot, if supported."""
         return None
+
+
+def _tool_time_limit_s() -> float:
+    """Active-time cap for one state-changing tool call (RPENT_TOOL_TIMEOUT_S).
+
+    Defaults to 50s so a stalled motion such as ``move_to`` is stopped and the
+    planner continues from the resulting state; 0 disables the cap.
+    """
+    try:
+        return max(0.0, float(os.environ.get("RPENT_TOOL_TIMEOUT_S", "50")))
+    except ValueError:
+        return 50.0
+
+
+# RPENT_COERCE_TOOL_ARGS (opt-in; SGD_COERCE_TOOL_ARGS is accepted as an alias):
+# Qwen3.6-27B sends integer arguments typed ["integer", "null"] in the schema
+# (back_project row/col, row_range/col_range, segment point) as JSON strings,
+# e.g. {"row": "800"} or {"row_range": "[280, 340]"}; every such call failed.
+# Convert a plain-number string to int/float, and a JSON-array string to a list,
+# only where the schema allows that type; leave everything else to the tool's
+# own checks.  The advertised schema is unchanged.
+_NUMBER = re.compile(r"^\s*-?\d+(\.\d+)?\s*$")
+
+
+def _coerce_tool_args_enabled() -> bool:
+    flag = os.environ.get("RPENT_COERCE_TOOL_ARGS")
+    if flag is None:
+        flag = os.environ.get("SGD_COERCE_TOOL_ARGS")
+    return flag == "1"
+
+
+def _schema_types(schema: dict[str, Any]) -> set[str]:
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        return set(kind)
+    return {kind} if isinstance(kind, str) else set()
+
+
+def _coerce_value(value: Any, schema: dict[str, Any]) -> Any:
+    types = _schema_types(schema)
+    if isinstance(value, str) and _NUMBER.match(value):
+        if "integer" in types and "." not in value:
+            return int(value)
+        if "number" in types:
+            return float(value)
+        if "integer" in types and float(value).is_integer():
+            return int(float(value))
+    if isinstance(value, str) and "array" in types and value.strip().startswith("["):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            value = parsed
+    if (
+        isinstance(value, list)
+        and "array" in types
+        and isinstance(schema.get("items"), dict)
+    ):
+        return [_coerce_value(item, schema["items"]) for item in value]
+    return value
+
+
+def _coerce_numeric_args(
+    args: dict[str, Any], schema: dict[str, Any]
+) -> dict[str, Any]:
+    props = schema.get("properties") or {}
+    return {
+        key: _coerce_value(value, props[key])
+        if isinstance(props.get(key), dict)
+        else value
+        for key, value in args.items()
+    }

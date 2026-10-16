@@ -199,3 +199,49 @@ def test_toolkit_modes_construct_with_fake_primitives(
         "finish", {"status": "failure", "summary": "budget spent"}
     )
     assert allowed.is_finish is True
+
+
+def _primitives(**kwargs: Any) -> Any:
+    from robots.libero.tools import LiberoPrimitives
+
+    return LiberoPrimitives(
+        env=object(),
+        model=object(),
+        sam3_client=object(),
+        check_cancelled=lambda: None,
+        **kwargs,
+    )
+
+
+def test_perception_slot_is_a_no_op_without_arbiter() -> None:
+    primitives = _primitives()
+
+    with primitives._perception_slot("vla"):
+        pass
+
+    assert primitives.perception_wait_s() == 0.0
+    assert primitives.perception_timing() == {
+        "enabled": False,
+        "queue_wait_s": 0.0,
+        "acquisitions": 0,
+    }
+
+
+def test_perception_slot_uses_shared_arbiter(tmp_path: Path) -> None:
+    from rpent.runtime.perception_arbiter import SharedPerceptionArbiter
+
+    arbiter = SharedPerceptionArbiter(tmp_path / "arbiter.sqlite3")
+    primitives = _primitives(perception_arbiter=arbiter)
+
+    with primitives._perception_slot("vla"):
+        pass
+    with primitives._perception_slot("sam3"):
+        pass
+
+    timing = primitives.perception_timing()
+    assert timing["enabled"] is True
+    assert timing["acquisitions"] == 2
+    robot_toolkit = object.__new__(toolkit.LiberoToolkit)
+    robot_toolkit._primitives = primitives
+    assert robot_toolkit.excluded_wait_s() == primitives.perception_wait_s()
+    assert robot_toolkit.resource_timing() == {"perception": timing}

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime
 from functools import partial
@@ -568,5 +569,14 @@ def _init_runtime(
             "task_id": args.task,
             "seed": args.seed,
         }
+
+    # Auto mode lets a LIBERO process join the host-local perception queue even
+    # when it starts after another RPent task.  Set RPENT_SHARED_PERCEPTION=off
+    # to retain the historical direct-client behavior.
+    mode = os.getenv("RPENT_SHARED_PERCEPTION", "auto").strip().lower()
+    if mode not in {"0", "false", "no", "off", "disabled"}:
+        from rpent.runtime.perception_arbiter import SharedPerceptionArbiter
+
+        runtime_kwargs["perception_arbiter"] = SharedPerceptionArbiter.from_env()
 
     return list(owned_daemons.values()), runtime_kwargs

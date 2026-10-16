@@ -49,6 +49,7 @@ from rpent.dashboard.events import (
 from rpent.dashboard.interaction import DashboardInteractionPort
 from rpent.dashboard.planner_control import DashboardPlannerControl
 from rpent.planner.base import REASONING_EFFORTS, PlannerResult, strip_mcp_prefix
+from rpent.planner.timing import ActiveClock, wait_thread_with_active_timeout
 from rpent.planner.utils.http_mcp_server import HttpMcpServer
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.config import get_repo_root
@@ -171,6 +172,7 @@ class CodexPlanner:
         )
 
         started = time.time()
+        clock = ActiveClock(toolkit)
         worker = threading.Thread(
             target=self._run_session,
             args=(
@@ -189,9 +191,11 @@ class CodexPlanner:
         worker.start()
         error: str | None = None
         try:
-            worker.join(timeout=self._timeout_s)
+            finished_in_budget = wait_thread_with_active_timeout(
+                worker, timeout_s=self._timeout_s, toolkit=toolkit
+            )
 
-            if worker.is_alive():
+            if not finished_in_budget:
                 error = f"Codex SDK timed out after {self._timeout_s}s"
                 try:
                     toolkit.cancel_active_and_wait()
@@ -234,6 +238,7 @@ class CodexPlanner:
             stats={
                 "backend": "codex_sdk",
                 "elapsed_s": round(elapsed, 1),
+                **{k: v for k, v in clock.stats().items() if k != "elapsed_s"},
                 "output_chars": len(text),
                 "output_path": str(output_path),
                 "raw_stream_path": str(raw_stream_path),

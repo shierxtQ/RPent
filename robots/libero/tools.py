@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ class LiberoPrimitives:
         check_cancelled: Callable[[], None],
         molmo_client: MolmoClient | None = None,
         flywheel_config: dict[str, Any] | None = None,
+        perception_arbiter: Any | None = None,
     ):
         self.env = env
         self.model = model
@@ -76,6 +78,9 @@ class LiberoPrimitives:
         self._recording = False
         self._frames = []
         self._flywheel_config = flywheel_config
+        # Optional cross-process scheduler for shared Pi0.5/SAM3 services.
+        # It is None by default, preserving the original single-task path.
+        self._perception_arbiter = perception_arbiter
         self._flywheel = None
 
     def start_recording(self):
@@ -129,6 +134,24 @@ class LiberoPrimitives:
     def finalize_flywheel(self) -> Path | None:
         return self._flywheel.finalize() if self._flywheel is not None else None
 
+    def _perception_slot(self, resource: str):
+        """Acquire the optional shared GPU perception slot."""
+        if self._perception_arbiter is None:
+            return nullcontext()
+        return self._perception_arbiter.hold("perception")
+
+    def perception_wait_s(self) -> float:
+        """Return queue wait accumulated by this environment process."""
+        if self._perception_arbiter is None:
+            return 0.0
+        return float(self._perception_arbiter.current_wait_s())
+
+    def perception_timing(self) -> dict[str, Any]:
+        """Return scheduler timing without requiring the feature to be enabled."""
+        if self._perception_arbiter is None:
+            return {"enabled": False, "queue_wait_s": 0.0, "acquisitions": 0}
+        return self._perception_arbiter.timing().as_dict()
+
     def _step_env(self, action) -> None:
         """Execute one env action between cancellation checkpoints."""
         self._check_cancelled()
@@ -156,7 +179,8 @@ class LiberoPrimitives:
             self._last_obs["task_descriptions"] = instruction
             self._last_obs.setdefault("extra_view_images", None)
 
-            actions = self.model.predict(self._last_obs, options={"mode": "eval"})
+            with self._perception_slot("vla"):
+                actions = self.model.predict(self._last_obs, options={"mode": "eval"})
             self._check_cancelled()
 
             vla_id = (
@@ -731,12 +755,13 @@ class LiberoPrimitives:
             }
 
         try:
-            data = self._sam3_client.segment(
-                state.load_bytes(image_name, step=nn),
-                text_prompt=prompt if has_prompt else None,
-                point=point,
-                min_score=min_score,
-            )
+            with self._perception_slot("sam3"):
+                data = self._sam3_client.segment(
+                    state.load_bytes(image_name, step=nn),
+                    text_prompt=prompt if has_prompt else None,
+                    point=point,
+                    min_score=min_score,
+                )
         except ValueError as e:
             return {
                 "error": str(e),

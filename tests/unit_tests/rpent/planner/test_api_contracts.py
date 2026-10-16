@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import queue
+import time
 from typing import Any
 
 import pytest
@@ -139,7 +140,17 @@ def test_successful_finish_waits_for_its_tool_result() -> None:
         "summary": "done",
     }
     assert result.error is None
-    assert result.stats == {
+    timing_keys = {
+        "elapsed_s",
+        "active_elapsed_s",
+        "excluded_wait_s",
+        "perception_wait_s",
+        "api_retry_wait_s",
+        "resource_timing",
+    }
+    assert timing_keys <= result.stats.keys()
+    assert result.stats["excluded_wait_s"] == 0
+    assert {k: v for k, v in result.stats.items() if k not in timing_keys} == {
         "turns_used": 1,
         "tool_calls": 1,
         "total_input_tokens": 7,
@@ -297,3 +308,80 @@ def test_no_images_mode_suppresses_binary_tool_content() -> None:
     assert isinstance(multimodal.content[0], BinaryContent)
     assert text_only == '{\n  "value": "visible"\n}'
     assert "secret" not in text_only
+
+
+def test_timeout_excludes_shared_perception_wait() -> None:
+    class WaitingToolkit(FakeToolkit):
+        def __init__(self) -> None:
+            super().__init__({"status": "success", "_finish": True})
+            self.started = time.perf_counter()
+
+        def excluded_wait_s(self) -> float:
+            # Pretend the whole run so far was spent queued for perception.
+            return time.perf_counter() - self.started
+
+    async def model(messages: list[Any], info: Any) -> ModelResponse:
+        del info
+        if any(isinstance(p, ToolReturnPart) for m in messages for p in m.parts):
+            return ModelResponse(parts=[TextPart("done")])
+        await asyncio.sleep(0.3)
+        return ModelResponse(
+            parts=[
+                ToolCallPart("finish", {"status": "success", "summary": "ok"}, "call-1")
+            ]
+        )
+
+    toolkit = WaitingToolkit()
+    result = solve_with_model(model, toolkit, RecordingSink(), timeout_s=0.1)
+
+    assert result.error is None
+    assert result.finish_result is not None
+    assert result.stats["excluded_wait_s"] > 0
+    assert result.stats["active_elapsed_s"] < 0.1
+
+
+def test_qwen_without_reasoning_disables_provider_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    from rpent.planner.api_loop import _build_model_settings
+
+    provider = OpenAIProvider(base_url="http://localhost:1/v1", api_key="test")
+    qwen = OpenAIChatModel("qwen3.6-27b", provider=provider)
+    other = OpenAIChatModel("glm-5.2", provider=provider)
+
+    assert _build_model_settings(qwen, 64, "none")["extra_body"] == {
+        "enable_thinking": False
+    }
+    assert "extra_body" not in _build_model_settings(qwen, 64, "low")
+    assert "extra_body" not in _build_model_settings(other, 64, "none")
+
+
+def test_qwen_settings_see_through_retry_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    from rpent.planner.api_loop import _build_model_settings
+    from rpent.planner.retry import RetryingModel
+
+    provider = OpenAIProvider(base_url="http://localhost:1/v1", api_key="test")
+    qwen = RetryingModel(OpenAIChatModel("qwen3.6-27b", provider=provider))
+
+    assert _build_model_settings(qwen, 64, "none")["extra_body"] == {
+        "enable_thinking": False
+    }

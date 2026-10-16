@@ -18,6 +18,7 @@ import base64
 import copy
 import json
 import threading
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -553,3 +554,125 @@ def test_toolkit_cooperatively_cancels_and_cleans_up_active_operation(
     assert toolkit.execute_tool(
         "finish", {"status": "failure", "summary": "cancelled"}
     ).is_finish
+
+
+_COERCE_SPEC = {
+    "name": "back_project",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "row": {"type": ["integer", "null"]},
+            "scale": {"type": "number"},
+            "row_range": {"type": ["array", "null"], "items": {"type": "integer"}},
+            "label": {"type": "string"},
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("flag", ["RPENT_COERCE_TOOL_ARGS", "SGD_COERCE_TOOL_ARGS"])
+def test_string_numbers_are_coerced_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    monkeypatch.delenv("RPENT_COERCE_TOOL_ARGS", raising=False)
+    monkeypatch.delenv("SGD_COERCE_TOOL_ARGS", raising=False)
+    monkeypatch.setenv(flag, "1")
+    toolkit = _ContractToolkit(tmp_path)
+
+    @readonly
+    def back_project(**kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    toolkit.add_tool("back_project", _COERCE_SPEC, back_project)
+
+    result = toolkit.execute_tool(
+        "back_project",
+        {"row": "800", "scale": "1.5", "row_range": '[280, "340"]', "label": "42"},
+    )
+
+    assert result.result == {
+        "row": 800,
+        "scale": 1.5,
+        "row_range": [280, 340],
+        "label": "42",
+    }
+    # Coercion happens at dispatch; the advertised schema is untouched.
+    assert toolkit._tools["back_project"][0] is _COERCE_SPEC
+    assert _COERCE_SPEC["input_schema"]["properties"]["row"] == {
+        "type": ["integer", "null"]
+    }
+
+
+def test_string_numbers_are_left_alone_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RPENT_COERCE_TOOL_ARGS", raising=False)
+    monkeypatch.delenv("SGD_COERCE_TOOL_ARGS", raising=False)
+    toolkit = _ContractToolkit(tmp_path)
+
+    @readonly
+    def back_project(**kwargs: Any) -> dict[str, Any]:
+        return kwargs
+
+    toolkit.add_tool("back_project", _COERCE_SPEC, back_project)
+
+    result = toolkit.execute_tool("back_project", {"row": "800"})
+
+    assert result.result == {"row": "800"}
+
+
+def _slow_motion(toolkit: Toolkit, seconds: float):
+    def move_to() -> dict[str, Any]:
+        deadline = time.perf_counter() + seconds
+        while time.perf_counter() < deadline:
+            toolkit.raise_if_cancelled()  # like LiberoPrimitives._step_env
+            time.sleep(0.01)
+        return {"arrived": True}
+
+    return move_to
+
+
+def test_stateful_tool_is_stopped_after_time_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_TOOL_TIMEOUT_S", "0.3")
+    toolkit = _ContractToolkit(tmp_path)
+    toolkit.add_tool("move_to", {"name": "move_to"}, _slow_motion(toolkit, 5))
+
+    started = time.perf_counter()
+    result = toolkit.execute_tool("move_to", {})
+
+    assert time.perf_counter() - started < 2
+    assert result.result["code"] == "tool_timeout"
+    assert result.result["interrupted"] is True
+    assert "tool time limit" in result.result["error"]
+    # The stopped tool still records the state it reached; the next tool runs.
+    assert len(toolkit.capture_calls) == 1
+    toolkit.add_tool("move_to_fast", {"name": "move_to_fast"}, _slow_motion(toolkit, 0))
+    assert toolkit.execute_tool("move_to_fast", {}).result == {"observation": 2}
+
+
+def test_tool_time_limit_excludes_perception_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_TOOL_TIMEOUT_S", "0.3")
+
+    class Waiting(_ContractToolkit):
+        def excluded_wait_s(self) -> float:
+            # The whole call so far was spent queued for shared perception.
+            return time.perf_counter()
+
+    toolkit = Waiting(tmp_path)
+    toolkit.add_tool("pi0_pick", {"name": "pi0_pick"}, _slow_motion(toolkit, 0.8))
+
+    assert toolkit.execute_tool("pi0_pick", {}).result == {"observation": 1}
+
+
+def test_tool_time_limit_can_be_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_TOOL_TIMEOUT_S", "0")
+    toolkit = _ContractToolkit(tmp_path)
+    toolkit.add_tool("move_to", {"name": "move_to"}, _slow_motion(toolkit, 0.5))
+
+    assert toolkit.execute_tool("move_to", {}).result == {"observation": 1}

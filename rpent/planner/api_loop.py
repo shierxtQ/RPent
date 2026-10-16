@@ -58,6 +58,7 @@ from rpent.dashboard.events import (
 from rpent.dashboard.interaction import DashboardInteractionPort, DashboardMessage
 from rpent.dashboard.planner_control import DashboardPlannerControl
 from rpent.planner.base import REASONING_EFFORTS, PlannerResult
+from rpent.planner.timing import ActiveClock, run_with_active_timeout
 from rpent.session import EnvState
 from rpent.tools.toolkit import Toolkit
 from rpent.utils.logging import get_logger
@@ -133,14 +134,20 @@ class ApiAgentLoop:
         )
         if input_queue is not None:
             return asyncio.run(solve)
+        clock = ActiveClock(toolkit)
         try:
-            return asyncio.run(asyncio.wait_for(solve, timeout=self._timeout_s))
+            # Shared-perception queue wait is excluded from the planner budget.
+            return asyncio.run(
+                run_with_active_timeout(
+                    solve, timeout_s=self._timeout_s, toolkit=toolkit
+                )
+            )
         except asyncio.TimeoutError:
             toolkit.cancel_active_and_wait()
             return PlannerResult(
                 finish_result=None,
                 messages=[{"role": "user", "content": user_message}],
-                stats={},
+                stats=clock.stats(),
                 error=f"API planner timed out after {self._timeout_s}s",
             )
 
@@ -154,6 +161,7 @@ class ApiAgentLoop:
         input_queue: queue.Queue[str | None] | None = None,
     ) -> PlannerResult:
         agent = self._build_agent(system_prompt, toolkit)
+        clock = ActiveClock(toolkit)
 
         interactive = input_queue is not None
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
@@ -279,7 +287,10 @@ class ApiAgentLoop:
         return PlannerResult(
             finish_result=observer.finish_result,
             messages=messages,
-            stats=_build_stats(usage, observer.turns, observer.tool_calls),
+            stats={
+                **_build_stats(usage, observer.turns, observer.tool_calls),
+                **clock.stats(),
+            },
             error=last_error,
         )
 
@@ -327,10 +338,12 @@ class ApiAgentLoop:
             no_images=self._no_images,
         )
         error: str | None = None
+        clock = ActiveClock(toolkit)
         try:
-            await asyncio.wait_for(
+            await run_with_active_timeout(
                 session.run(user_message),
-                timeout=self._timeout_s,
+                timeout_s=self._timeout_s,
+                toolkit=toolkit,
             )
         except asyncio.TimeoutError:
             error = f"API planner timed out after {self._timeout_s}s"
@@ -355,6 +368,7 @@ class ApiAgentLoop:
             stats={
                 "backend": "api",
                 **_build_stats(session.usage, observer.turns, observer.tool_calls),
+                **clock.stats(),
             },
             error=error or session.error,
         )
@@ -368,7 +382,9 @@ class ApiAgentLoop:
             self._model,
             instructions=system_prompt or None,
             tools=_build_tools(toolkit, no_images=self._no_images),
-            model_settings=_build_model_settings(self._model, self._max_tokens),
+            model_settings=_build_model_settings(
+                self._model, self._max_tokens, self._reasoning_effort
+            ),
             capabilities=[
                 Thinking(effort=thinking_effort),
                 ProcessHistory(processor=_prune_history_images),
@@ -624,10 +640,16 @@ class _ApiDashboardSession:
                     await self._control.tool_completed(self)
 
 
-def _build_model_settings(model: Model, max_tokens: int) -> ModelSettings:
+def _build_model_settings(
+    model: Model, max_tokens: int, reasoning_effort: str | None = None
+) -> ModelSettings:
     """Build model settings, enabling prompt caching for Anthropic models."""
     from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
+    from pydantic_ai.models.openai import OpenAIChatModel
 
+    from rpent.planner.retry import unwrap_retry
+
+    model = unwrap_retry(model)
     if isinstance(model, AnthropicModel):
         return AnthropicModelSettings(
             max_tokens=max_tokens,
@@ -635,7 +657,16 @@ def _build_model_settings(model: Model, max_tokens: int) -> ModelSettings:
             anthropic_cache_tool_definitions=True,
             anthropic_cache_messages=True,
         )
-    return ModelSettings(max_tokens=max_tokens)
+    settings = ModelSettings(max_tokens=max_tokens)
+    # Pydantic AI has no thinking switch for Qwen chat endpoints, so "none"
+    # would still let hybrid Qwen models think; send the provider field.
+    if (
+        reasoning_effort == "none"
+        and isinstance(model, OpenAIChatModel)
+        and "qwen" in model.model_name.lower()
+    ):
+        settings["extra_body"] = {"enable_thinking": False}
+    return settings
 
 
 def _prune_history_images(messages: list[ModelMessage]) -> list[ModelMessage]:

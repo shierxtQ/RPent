@@ -20,6 +20,7 @@ LIBERO primitives (``move_to``, ``pi0_pick``, ``release``, ...) on top.
 
 from __future__ import annotations
 
+import json
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -192,6 +193,14 @@ class LiberoToolkit(Toolkit):
         """Return the action primitives this toolkit drives."""
         return self._primitives
 
+    def excluded_wait_s(self) -> float:
+        """Time waiting for shared perception, excluded from active budgets."""
+        return self._primitives.perception_wait_s()
+
+    def resource_timing(self) -> dict[str, Any]:
+        """Return local shared-resource accounting for this episode."""
+        return {"perception": self._primitives.perception_timing()}
+
     def init_primitives(
         self,
         *,
@@ -228,6 +237,19 @@ class LiberoToolkit(Toolkit):
             # The runner is in the cleanup path; never let a video save
             # abort it.
             logger.warning(f"failed to save episode video: {e}")
+
+        # Older test doubles and integrations may not provide an output dir;
+        # timing persistence is best-effort and must not change cleanup behavior.
+        timing_dir = getattr(self, "_state_output_dir", None)
+        if timing_dir is not None:
+            try:
+                timing_path = timing_dir / "resource_timing.json"
+                timing_path.write_text(
+                    json.dumps(self.resource_timing(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logger.warning(f"failed to save resource timing: {e}")
 
     def solved(self) -> bool:
         """Return whether this run has completed the task."""

@@ -122,14 +122,16 @@ class Planner(Protocol):
 # ---------------------------------------------------------------------------
 
 
-def build_api_model(model: str | None, base_url: str | None = None) -> "Model":
+def build_api_model(
+    model: str | None, base_url: str | None = None, *, api_key: str | None = None
+) -> "Model":
     """Resolve the pydantic-ai model used by the ``api`` planner.
 
     This is the single provider-resolution path: both :func:`build_planner`
     and the connectivity check in :mod:`rpent.planner.check` call it, so a
     passing check constructs the same model a real run will.
 
-    The API key is always read from the provider's own env vars (e.g.
+    By default the API key is read from the provider's own env vars (e.g.
     ``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``). When ``base_url`` is given it
     overrides the provider's base URL env var (e.g. ``ANTHROPIC_BASE_URL`` /
     ``OPENAI_BASE_URL``).
@@ -137,6 +139,7 @@ def build_api_model(model: str | None, base_url: str | None = None) -> "Model":
     Args:
         model: Provider-prefixed model id, e.g. ``anthropic:claude-opus-4-8``.
         base_url: Base URL overriding the provider's own env var.
+        api_key: Explicit credential for independently configured planner roles.
 
     Returns:
         The resolved pydantic-ai ``Model``.
@@ -158,13 +161,17 @@ def build_api_model(model: str | None, base_url: str | None = None) -> "Model":
 
     def _provider_factory(provider_name: str):
         """Build the provider for ``provider_name``."""
-        if not base_url:
+        if not base_url and api_key is None:
             return infer_provider(provider_name)
         provider_cls = infer_provider_class(provider_name)
         params = inspect.signature(provider_cls.__init__).parameters
         kwargs = {}
-        if "base_url" in params:
+        if base_url and "base_url" in params:
             kwargs["base_url"] = base_url
+        if api_key is not None:
+            if "api_key" not in params:
+                raise ValueError(f"{provider_name} does not accept an explicit API key")
+            kwargs["api_key"] = api_key
         return provider_cls(**kwargs)
 
     return infer_model(model, provider_factory=_provider_factory)
@@ -192,8 +199,17 @@ def build_planner(
 
     if planner_type == "api":
         from rpent.planner.api_loop import ApiAgentLoop
+        from rpent.planner.retry import retry_from_env
 
-        api_model = build_api_model(model, base_url)
+        # Retries 429/5xx with backoff so a shared provider quota does not end
+        # the episode (RPENT_API_RETRIES=0 disables).
+        api_model = retry_from_env(build_api_model(model, base_url))
+        # RPENT_ESCALATION=1 (opt-in): a senior model takes event-triggered turns.
+        from rpent.planner.escalation import escalation_from_env
+
+        api_model = escalation_from_env(
+            api_model, output_dir=output_dir, reasoning_effort=reasoning_effort
+        )
         api_timeout_s = planner_timeout_s
         if api_timeout_s is None:
             api_timeout_s = int(os.environ.get("CELL_TIMEOUT_S", "1200"))
