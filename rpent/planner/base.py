@@ -215,6 +215,11 @@ def build_planner(
         api_model = escalation_from_env(
             api_model, output_dir=output_dir, reasoning_effort=reasoning_effort
         )
+        # RPENT_COERCE_TOOL_ARGS=1 also repairs leading-zero numbers that make a
+        # tool call's argument JSON invalid (worker and senior replies alike).
+        from rpent.planner.tool_args import tool_args_repair_from_env
+
+        api_model = tool_args_repair_from_env(api_model)
         api_timeout_s = planner_timeout_s
         if api_timeout_s is None:
             api_timeout_s = int(os.environ.get("CELL_TIMEOUT_S", "1200"))

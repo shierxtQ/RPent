@@ -27,6 +27,7 @@ import base64
 import contextlib
 import dataclasses
 import json
+import os
 import queue
 from collections import deque
 from collections.abc import Callable
@@ -75,6 +76,28 @@ _MAX_HISTORY_IMAGE_BYTES = 4 * 1024 * 1024
 #: Always retain at least this many of the most recent images, even if a single
 #: frame exceeds the byte budget, so the model never loses its current view.
 _MIN_RECENT_IMAGES = 2
+
+#: Sent when a non-interactive run's reply had no tool call and
+#: RPENT_CONTINUE_NOTES allows another note (see ``_continue_notes``).
+_CONTINUE_NOTE = (
+    "[harness] Your last reply had no tool call, so nothing was executed and the "
+    "episode is still running. Continue with your next tool call, or call finish "
+    "when the task is done or cannot be completed."
+)
+
+
+def _continue_notes() -> int:
+    """How many replies without a tool call a non-interactive run may survive.
+
+    RPENT_CONTINUE_NOTES (default 0: the first such reply ends the run). Qwen
+    workers sometimes answer with only a label such as
+    ``[senior planner guidance]``; each allowed note resumes the same
+    conversation with :data:`_CONTINUE_NOTE` instead of ending the episode.
+    """
+    try:
+        return max(0, int(os.environ.get("RPENT_CONTINUE_NOTES", "0")))
+    except ValueError:
+        return 0
 
 
 class ApiAgentLoop:
@@ -213,15 +236,20 @@ class ApiAgentLoop:
 
         seed = user_message
         history: list[ModelMessage] | None = None
+        notes_left = 0 if interactive else _continue_notes()
+        # Usage of the runs a continue note resumed, so the totals cover them.
+        carried_usage: RunUsage | None = None
         try:
             while True:
                 run_turns = 0
+                ended_without_tool_call = False
                 # request_limit overrides pydantic-ai's default (50) so the
                 # manual max_turns break below is what bounds each run.
                 async with agent.iter(
                     seed,
                     message_history=history,
                     usage_limits=UsageLimits(request_limit=max_turns + 1),
+                    usage=carried_usage,
                 ) as run:
                     async for node in run:
                         if interactive and _inject_pending(run):
@@ -248,10 +276,16 @@ class ApiAgentLoop:
                                 )
                                 break
                         elif Agent.is_end_node(node):
+                            ended_without_tool_call = True
                             if interactive:
                                 logger.info(
                                     "model ended turn without a tool call "
                                     "— awaiting your input."
+                                )
+                            elif notes_left > 0:
+                                logger.info(
+                                    "model ended turn without a tool call; "
+                                    "continuing with a harness note."
                                 )
                             else:
                                 logger.info(
@@ -262,6 +296,19 @@ class ApiAgentLoop:
                     usage = run.usage
                     if interactive:
                         history = run.all_messages()
+
+                if (
+                    ended_without_tool_call
+                    and notes_left > 0
+                    and observer.finish_result is None
+                    and observer.turns < max_turns
+                ):
+                    notes_left -= 1
+                    history = run.all_messages()
+                    carried_usage = usage
+                    seed = _CONTINUE_NOTE
+                    messages.append({"role": "user", "content": seed})
+                    continue
 
                 # finish, quit, non-interactive, or the cumulative turn budget is
                 # spent => end the whole session so max_turns is enforced across

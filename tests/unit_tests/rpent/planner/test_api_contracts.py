@@ -385,3 +385,66 @@ def test_qwen_settings_see_through_retry_wrapper(
     assert _build_model_settings(qwen, 64, "none")["extra_body"] == {
         "enable_thinking": False
     }
+
+
+def _text_then_finish(calls: list[int]):
+    def model(messages: list[Any], info: Any) -> ModelResponse:
+        calls.append(len(messages))
+        if len(calls) == 1:
+            return ModelResponse(parts=[TextPart("[senior planner guidance]")])
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "finish", {"status": "success", "summary": "done"}, "finish-call"
+                )
+            ]
+        )
+
+    return model
+
+
+def test_reply_without_tool_call_ends_the_run_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RPENT_CONTINUE_NOTES", raising=False)
+    calls: list[int] = []
+    toolkit = FakeToolkit()
+
+    result = solve_with_model(_text_then_finish(calls), toolkit, RecordingSink())
+
+    assert len(calls) == 1
+    assert result.finish_result is None
+    assert toolkit.calls == []
+
+
+def test_continue_note_resumes_after_a_reply_without_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RPENT_CONTINUE_NOTES", "2")
+    calls: list[int] = []
+    toolkit = FakeToolkit()
+
+    result = solve_with_model(_text_then_finish(calls), toolkit, RecordingSink())
+
+    assert len(calls) == 2
+    assert toolkit.calls == [("finish", {"status": "success", "summary": "done"})]
+    assert result.finish_result["status"] == "success"
+    assert any(
+        m["role"] == "user" and m["content"].startswith("[harness] Your last reply")
+        for m in result.messages
+    )
+    assert result.stats["requests"] == 2
+
+
+def test_continue_notes_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RPENT_CONTINUE_NOTES", "2")
+    calls: list[int] = []
+
+    def silent(messages: list[Any], info: Any) -> ModelResponse:
+        calls.append(len(messages))
+        return ModelResponse(parts=[TextPart("thinking")])
+
+    result = solve_with_model(silent, FakeToolkit(), RecordingSink())
+
+    assert len(calls) == 3
+    assert result.finish_result is None
