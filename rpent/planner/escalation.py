@@ -32,6 +32,12 @@ shares the same conversation and takes the next request only when:
 ``low``), ``RPENT_ESCALATION_CHECKIN`` (default 12) and
 ``RPENT_ESCALATION_MAX_SHARE`` (default 0.2). Every request is logged to
 ``escalation.jsonl`` in the run output directory.
+
+``RPENT_ESCALATION_SENIOR_MAX_IMAGES`` (optional) keeps only that many of the
+newest images in senior requests. The shared history is bounded by image
+bytes, which lets long runs with small frames carry about 100 images; the
+senior gateway rejects requests above 64-80 images (HTTP 400
+``image_compression_failed``). Worker requests are unchanged.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -201,6 +208,38 @@ class _ReplayStream(StreamedResponse):
         return self._response.timestamp
 
 
+def _newest_images(messages: list[ModelMessage], keep: int) -> list[ModelMessage]:
+    """Copy of ``messages`` with all but the ``keep`` newest images replaced by a note."""
+    located = [
+        (mi, pi, ii)
+        for mi, message in enumerate(messages)
+        if isinstance(message, ModelRequest)
+        for pi, part in enumerate(message.parts)
+        if isinstance(part, UserPromptPart) and isinstance(part.content, list)
+        for ii, item in enumerate(part.content)
+        if isinstance(item, BinaryContent) and item.media_type.startswith("image/")
+    ]
+    drop = set(located[: max(0, len(located) - keep)])
+    if not drop:
+        return messages
+    out = list(messages)
+    for mi in sorted({mi for mi, _, _ in drop}):
+        parts = list(out[mi].parts)
+        for pi, part in enumerate(parts):
+            if any((mi, pi, ii) in drop for ii in range(len(part.content or ()))):
+                parts[pi] = dataclasses.replace(
+                    part,
+                    content=[
+                        "[earlier camera image omitted for the senior]"
+                        if (mi, pi, ii) in drop
+                        else item
+                        for ii, item in enumerate(part.content)
+                    ],
+                )
+        out[mi] = dataclasses.replace(out[mi], parts=parts)
+    return out
+
+
 class EscalationModel(WrapperModel):
     """Route each request to the worker, or to the senior on an escalation event."""
 
@@ -215,6 +254,7 @@ class EscalationModel(WrapperModel):
         max_share: float = 0.2,
         max_vetoes: int = 3,
         log_path: Path | None = None,
+        senior_max_images: int | None = None,
     ) -> None:
         super().__init__(worker)
         if checkin < 1 or not 0 < max_share <= 1 or max_vetoes < 0:
@@ -226,6 +266,7 @@ class EscalationModel(WrapperModel):
         self.max_share = max_share
         self.max_vetoes = max_vetoes
         self.log_path = log_path
+        self.senior_max_images = senior_max_images
         self.requests = 0
         self.senior_requests = 0
         self.since_senior = 0
@@ -328,6 +369,8 @@ class EscalationModel(WrapperModel):
         extra = self.senior_settings if senior else self.worker_settings
         if senior:
             params = _object_roots(params)
+            if self.senior_max_images is not None:
+                messages = _newest_images(messages, self.senior_max_images)
         started = time.monotonic()
         record: dict[str, Any] = {
             "request": self.requests + 1,
@@ -497,4 +540,9 @@ def escalation_from_env(
         checkin=int(os.environ.get("RPENT_ESCALATION_CHECKIN", "12")),
         max_share=float(os.environ.get("RPENT_ESCALATION_MAX_SHARE", "0.2")),
         log_path=Path(output_dir) / "escalation.jsonl",
+        senior_max_images=(
+            int(os.environ["RPENT_ESCALATION_SENIOR_MAX_IMAGES"])
+            if os.environ.get("RPENT_ESCALATION_SENIOR_MAX_IMAGES")
+            else None
+        ),
     )

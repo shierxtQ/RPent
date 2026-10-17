@@ -191,3 +191,47 @@ def test_senior_tools_keep_object_root_while_worker_keeps_relaxed_schema():
     asyncio.run(model.request(READY, None, params))
 
     assert seen == {"worker": ["object", "string"], "senior": "object"}
+
+
+def _image_counts(messages):
+    from pydantic_ai.messages import BinaryContent
+
+    images = omitted = 0
+    for message in messages:
+        for part in getattr(message, "parts", ()):
+            if isinstance(part, UserPromptPart) and isinstance(part.content, list):
+                for item in part.content:
+                    images += isinstance(item, BinaryContent)
+                    omitted += item == "[earlier camera image omitted for the senior]"
+    return images, omitted
+
+
+def test_senior_image_cap_keeps_the_newest_images_and_spares_the_worker():
+    from pydantic_ai.messages import BinaryContent
+
+    seen = {}
+
+    def reply(role):
+        def respond(messages):
+            seen[role] = _image_counts(messages)
+            return call("move_to")
+
+        return respond
+
+    frames = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    [f"frame {i}", BinaryContent(bytes([i]) * 8, media_type="image/png")]
+                )
+            ]
+        )
+        for i in range(5)
+    ]
+    model, _, _ = build(reply("worker"), reply("senior"), senior_max_images=2)
+
+    ask(model, START + frames)
+    ask(model, READY + frames)
+
+    assert seen["worker"] == (5, 0)
+    assert seen["senior"] == (2, 3)
