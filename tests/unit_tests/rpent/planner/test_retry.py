@@ -127,3 +127,42 @@ def test_retry_backoff_is_excluded_from_active_timeout() -> None:
     assert clock.retry_wait_s() >= 0.45
     assert clock.active_s() < 0.15
     assert ActiveClock(toolkit=object()).retry_wait_s() == 0
+
+
+def _raising(errors: list[Exception]):
+    calls = {"n": 0}
+
+    def model(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        calls["n"] += 1
+        if errors:
+            raise errors.pop(0)
+        return ModelResponse(parts=[TextPart("ok")])
+
+    return model, calls
+
+
+def test_streamed_gateway_outage_without_status_is_retried() -> None:
+    from pydantic_ai.exceptions import ModelAPIError
+
+    outage = ModelAPIError(
+        "gpt-6-astra",
+        "upstream_error: The service is temporarily unavailable. Please retry later.",
+    )
+    function, calls = _raising([outage, outage])
+    model = RetryingModel(FunctionModel(function), retries=3, base_s=0)
+
+    assert _request(model).parts[0].content == "ok"
+    assert calls["n"] == 3
+    assert model.retry_count == 2
+
+
+def test_other_status_less_errors_are_not_retried() -> None:
+    from pydantic_ai.exceptions import ModelAPIError
+
+    function, calls = _raising([ModelAPIError("gpt-6-astra", "invalid tool schema")])
+    model = RetryingModel(FunctionModel(function), retries=3, base_s=0)
+
+    with pytest.raises(ModelAPIError):
+        _request(model)
+    assert calls["n"] == 1

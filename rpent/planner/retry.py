@@ -23,6 +23,12 @@ Backoff time is excluded from the planner's active-time budget.
 
 ``RPENT_API_RETRIES`` (default 8, 0 disables), ``RPENT_API_RETRY_BASE_S``
 (default 5) and ``RPENT_API_RETRY_MAX_S`` (default 60) tune the policy.
+
+A gateway outage can also arrive inside a streamed response ("upstream_error:
+The service is temporarily unavailable"), which Pydantic AI raises as a
+``ModelAPIError`` without an HTTP status. ``request`` retries those too: the
+streaming wrappers consume the whole stream inside ``request``, so nothing has
+reached the caller yet.
 """
 
 from __future__ import annotations
@@ -34,7 +40,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.wrapper import WrapperModel
@@ -47,6 +53,14 @@ logger = get_logger("api_retry")
 
 #: Rate limiting plus transient gateway/server failures (529: Anthropic overloaded).
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504, 529})
+#: Message fragments of transient failures that arrive without an HTTP status.
+TRANSIENT_MESSAGES = (
+    "temporarily unavailable",
+    "upstream_error",
+    "connection error",
+    "overloaded",
+    "server_error",
+)
 
 
 class RetryingModel(WrapperModel):
@@ -72,14 +86,16 @@ class RetryingModel(WrapperModel):
         delay = min(self.max_s, self.base_s * 2**attempt)
         return delay * random.uniform(0.8, 1.2)
 
-    async def _backoff(self, exc: ModelHTTPError, attempt: int) -> None:
+    async def _backoff(self, exc: ModelAPIError, attempt: int) -> None:
         delay = self._delay_s(attempt)
         self.retry_count += 1
         self.retry_wait_s += delay
         logger.warning(
-            "model %s returned HTTP %s; retry %d/%d in %.1fs",
+            "model %s returned %s; retry %d/%d in %.1fs",
             self.model_name,
-            exc.status_code,
+            f"HTTP {exc.status_code}"
+            if isinstance(exc, ModelHTTPError)
+            else f"{str(exc)[:120]!r}",
             attempt + 1,
             self.retries,
             delay,
@@ -89,6 +105,10 @@ class RetryingModel(WrapperModel):
 
     def _retryable(self, exc: ModelHTTPError, attempt: int) -> bool:
         return exc.status_code in RETRYABLE_STATUS and attempt < self.retries
+
+    def _retryable_streamed(self, exc: ModelAPIError, attempt: int) -> bool:
+        message = str(exc).lower()
+        return attempt < self.retries and any(m in message for m in TRANSIENT_MESSAGES)
 
     async def request(
         self,
@@ -104,6 +124,11 @@ class RetryingModel(WrapperModel):
                 )
             except ModelHTTPError as exc:
                 if not self._retryable(exc, attempt):
+                    raise
+                await self._backoff(exc, attempt)
+                attempt += 1
+            except ModelAPIError as exc:
+                if not self._retryable_streamed(exc, attempt):
                     raise
                 await self._backoff(exc, attempt)
                 attempt += 1
