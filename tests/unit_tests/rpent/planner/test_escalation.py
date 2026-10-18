@@ -235,3 +235,115 @@ def test_senior_image_cap_keeps_the_newest_images_and_spares_the_worker():
 
     assert seen["worker"] == (5, 0)
     assert seen["senior"] == (2, 3)
+
+
+def _routed(model, requests):
+    """Tool names of the replies to ``requests`` in order (worker: move_to, senior: segment)."""
+    return [ask(model, messages).parts[-1].tool_name for messages in requests]
+
+
+def _senior_marking(markers):
+    """Senior reply that opens with ``markers[key]`` when the note contains ``key``."""
+
+    def reply(messages):
+        note = " ".join(
+            p.content
+            for p in messages[-1].parts
+            if isinstance(p, UserPromptPart) and isinstance(p.content, str)
+        )
+        text = next((m for key, m in markers.items() if key in note), "guidance")
+        return ModelResponse(parts=[TextPart(text), ToolCallPart("segment", {})])
+
+    return reply
+
+
+def test_plan_turn_can_be_switched_off():
+    model, _, senior = build(
+        lambda m: call("move_to"), lambda m: call("segment"), plan_turn=False
+    )
+
+    assert _routed(model, [READY, READY]) == ["move_to", "move_to"]
+    assert senior.notes == []
+
+
+def test_plan_note_carries_the_task_memory():
+    model, _, senior = build(
+        lambda m: call("move_to"),
+        lambda m: call("segment"),
+        plan_memory="=== task-specific/X_s0.json ===\nopen the drawer first",
+    )
+
+    _routed(model, [START, READY])
+
+    assert "open the drawer first" in senior.notes[0]
+    assert "numbered steps" in senior.notes[0]
+
+
+def test_checkin_takeover_keeps_the_senior_for_k_requests():
+    model, _, senior = build(
+        lambda m: call("move_to"),
+        _senior_marking({"periodic review": "[TAKE CONTROL] the grasp keeps missing"}),
+        checkin=1,
+        max_share=1.0,
+        takeover=2,
+    )
+
+    routed = _routed(model, [START, READY, READY, READY, READY, READY, READY])
+
+    assert routed == [
+        "move_to",  # worker reads memory
+        "segment",  # plan
+        "move_to",
+        "segment",  # check-in takes control
+        "segment",  # control 1 of 2
+        "segment",  # control 2 of 2
+        "move_to",  # back to the worker
+    ]
+    assert "start your reply" in senior.notes[1] and "[TAKE CONTROL]" in senior.notes[1]
+    assert "control turn 1 of 2" in senior.notes[2]
+    assert (model.takeovers, model.control_requests, model.senior_requests) == (1, 2, 2)
+
+
+def test_hand_back_ends_the_takeover_early():
+    model, _, _ = build(
+        lambda m: call("move_to"),
+        _senior_marking(
+            {"periodic review": "[TAKE CONTROL] off track", "control turn": "[HAND BACK] ok"}
+        ),
+        checkin=1,
+        max_share=1.0,
+        takeover=3,
+    )
+
+    routed = _routed(model, [START, READY, READY, READY, READY, READY])
+
+    assert routed == ["move_to", "segment", "move_to", "segment", "segment", "move_to"]
+    assert model.control_requests == 1
+
+
+def test_take_control_marker_is_ignored_when_takeover_is_off():
+    model, _, senior = build(
+        lambda m: call("move_to"),
+        _senior_marking({"periodic review": "[TAKE CONTROL] off track"}),
+        checkin=1,
+        max_share=1.0,
+    )
+
+    routed = _routed(model, [START, READY, READY, READY, READY])
+
+    assert routed == ["move_to", "segment", "move_to", "segment", "move_to"]
+    assert all("[TAKE CONTROL]" not in note for note in senior.notes)
+
+
+def test_load_plan_memory_reads_files_in_full_and_marks_missing_ones(tmp_path):
+    from rpent.planner.escalation import load_plan_memory
+
+    (tmp_path / "global").mkdir()
+    (tmp_path / "global" / "GLOBAL_MEMORY.md").write_text("x" * 90000)
+
+    text = load_plan_memory(
+        [str(tmp_path / "global" / "GLOBAL_MEMORY.md"), str(tmp_path / "task-specific" / "T_s0.json")]
+    )
+
+    assert "=== global/GLOBAL_MEMORY.md ===\n" + "x" * 90000 in text
+    assert "=== task-specific/T_s0.json === (not present)" in text

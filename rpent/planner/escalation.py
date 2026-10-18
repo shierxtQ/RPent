@@ -38,6 +38,18 @@ newest images in senior requests. The shared history is bounded by image
 bytes, which lets long runs with small frames carry about 100 images; the
 senior gateway rejects requests above 64-80 images (HTTP 400
 ``image_compression_failed``). Worker requests are unchanged.
+
+Optional mechanisms (off by default; each can be switched on alone):
+
+- ``RPENT_ESCALATION_PLAN=0`` skips the ``plan`` turn.
+- ``RPENT_ESCALATION_PLAN_FILES`` (paths joined by ``os.pathsep``): the
+  ``plan`` turn receives these files in full, so the senior's strategy is built
+  from the task memory instead of whatever the worker happened to read.
+- ``RPENT_ESCALATION_TAKEOVER=K``: at a check-in, error, stall or give-up turn
+  the senior may start its reply with ``[TAKE CONTROL]``; it then answers the
+  next K requests (reason ``control``) unless it starts a reply with
+  ``[HAND BACK]``. ``RPENT_ESCALATION_MAX_TAKEOVERS`` (default 4) bounds the
+  takeovers per run. Control turns are not counted against ``max_share``.
 """
 
 from __future__ import annotations
@@ -85,6 +97,10 @@ STALL_WINDOW = 4
 STALL_SPAN_M = 0.01
 PLAN_FALLBACK_REQUEST = 6
 SENIOR_LABEL = "[senior planner guidance]"
+TAKE_CONTROL = "[TAKE CONTROL]"
+HAND_BACK = "[HAND BACK]"
+#: Senior turns that may hand control to the senior (not ``plan`` or ``control``).
+TAKEOVER_REASONS = frozenset({"stall", "errors", "checkin", "giveup"})
 
 
 def _results(messages: list[ModelMessage]) -> Iterator[tuple[str, dict]]:
@@ -130,6 +146,23 @@ def _giveup(response: ModelResponse) -> dict | None:
             if str(args.get("status", "")).lower() != "success":
                 return args
     return None
+
+
+def _reply_text(response: ModelResponse) -> str:
+    return "\n".join(p.content for p in response.parts if isinstance(p, TextPart))
+
+
+def load_plan_memory(paths: list[str]) -> str:
+    """The listed files in full, each under a ``=== <parent>/<name> ===`` heading."""
+    blocks = []
+    for raw in paths:
+        path = Path(raw)
+        name = f"{path.parent.name}/{path.name}"
+        try:
+            blocks.append(f"=== {name} ===\n{path.read_text(errors='replace').strip()}")
+        except OSError:
+            blocks.append(f"=== {name} === (not present)")
+    return "\n\n".join(blocks)
 
 
 def _has_tool_call(response: ModelResponse) -> bool:
@@ -255,10 +288,16 @@ class EscalationModel(WrapperModel):
         max_vetoes: int = 3,
         log_path: Path | None = None,
         senior_max_images: int | None = None,
+        plan_turn: bool = True,
+        plan_memory: str | None = None,
+        takeover: int = 0,
+        max_takeovers: int = 4,
     ) -> None:
         super().__init__(worker)
         if checkin < 1 or not 0 < max_share <= 1 or max_vetoes < 0:
             raise ValueError("invalid escalation budget")
+        if takeover < 0 or max_takeovers < 0:
+            raise ValueError("invalid takeover budget")
         self.senior = senior
         self.worker_settings = worker_settings or {}
         self.senior_settings = senior_settings or {}
@@ -267,10 +306,17 @@ class EscalationModel(WrapperModel):
         self.max_vetoes = max_vetoes
         self.log_path = log_path
         self.senior_max_images = senior_max_images
+        self.plan_memory = plan_memory
+        self.takeover = takeover
+        self.max_takeovers = max_takeovers
+        self.takeovers = 0
+        # Requests left in the current takeover, and requests the senior answered in control.
+        self.control_left = 0
+        self.control_requests = 0
         self.requests = 0
         self.senior_requests = 0
         self.since_senior = 0
-        self.planned = False
+        self.planned = not plan_turn
         self.vetoes = 0
         # Tool results already reviewed by the senior do not trigger again.
         self.reviewed_results = 0
@@ -278,6 +324,8 @@ class EscalationModel(WrapperModel):
     # -- routing ---------------------------------------------------------------
 
     def _trigger(self, messages: list[ModelMessage]) -> str | None:
+        if self.control_left > 0:
+            return "control"
         results = list(_results(messages))
         if not self.planned:
             names = {name for name, _ in results}
@@ -303,6 +351,14 @@ class EscalationModel(WrapperModel):
         return None
 
     def _senior_note(self, reason: str, proposal: dict | None = None) -> str:
+        if reason == "control":
+            turn = self.takeover - self.control_left + 1
+            return (
+                "[harness] You are in control of this episode (control turn "
+                f"{turn} of {self.takeover}); the worker is paused. Review the latest "
+                "results and images and make the next tool call yourself. Start your "
+                f"reply with {HAND_BACK} once the worker can safely continue from here."
+            )
         why = {
             "plan": "memory and the initial scene have been read; set the overall strategy",
             "stall": "the last robot motions barely moved the end effector",
@@ -323,6 +379,30 @@ class EscalationModel(WrapperModel):
                 f"\nThe worker proposed finish(status={proposal.get('status')!r}): "
                 f"{summary}\nIf the task can still be completed, keep working; "
                 "otherwise call finish yourself."
+            )
+        if reason == "plan" and self.plan_memory:
+            note += (
+                "\nThe task memory for this run follows in full: references from an "
+                "earlier solved episode of this task and cross-task lessons. Treat it "
+                "as a procedural prior and re-ground every object, fixture and "
+                "coordinate from the live observations. Write the plan for the worker "
+                "as short numbered steps (the skill or primitive, the object or "
+                "fixture, and how to confirm the step from task_progress), then make "
+                "the first tool call yourself.\n\n" + self.plan_memory
+            )
+        if (
+            reason in TAKEOVER_REASONS
+            and self.takeover
+            and self.takeovers < self.max_takeovers
+        ):
+            note += (
+                "\nIf the episode is off track (no task progress over the recent "
+                "attempts, the same skill repeated without effect, an object lost or "
+                "misplaced, or the worker misreading the state), start your reply "
+                f"with {TAKE_CONTROL}: you then make the next {self.takeover} "
+                "requests yourself, and you can return control earlier by starting a "
+                f"reply with {HAND_BACK}. If the worker is on track, give brief "
+                "guidance and make one call as usual."
             )
         return note
 
@@ -437,6 +517,8 @@ class EscalationModel(WrapperModel):
             proposal = None
 
         note = self._senior_note(reason, proposal)
+        if reason == "plan" and self.plan_memory:
+            self._log({"request": self.requests + 1, "plan_memory_chars": len(self.plan_memory)})
         response = await self._call(
             "senior",
             reason,
@@ -445,6 +527,23 @@ class EscalationModel(WrapperModel):
             model_request_parameters,
         )
         self.planned = True
+        text = _reply_text(response)
+        if reason == "control":
+            self.control_left -= 1
+            if HAND_BACK in text:
+                self.control_left = 0
+                self._log({"request": self.requests + 1, "hand_back": self.takeovers})
+        elif (
+            reason in TAKEOVER_REASONS
+            and self.takeover
+            and self.takeovers < self.max_takeovers
+            and TAKE_CONTROL in text
+        ):
+            self.takeovers += 1
+            self.control_left = self.takeover
+            self._log(
+                {"request": self.requests + 1, "takeover": self.takeovers, "after": reason}
+            )
         if not _has_tool_call(response):
             # A text-only reply would end the run; hand the guidance to the worker.
             guidance = "\n".join(
@@ -460,13 +559,18 @@ class EscalationModel(WrapperModel):
             response = dataclasses.replace(
                 worker, parts=[TextPart(f"{SENIOR_LABEL} {guidance}"), *worker.parts]
             )
-        self._advance(messages, senior=True)
+        self._advance(messages, senior=True, control=reason == "control")
         return response
 
-    def _advance(self, messages: list[ModelMessage], *, senior: bool) -> None:
+    def _advance(
+        self, messages: list[ModelMessage], *, senior: bool, control: bool = False
+    ) -> None:
         self.requests += 1
         if senior:
-            self.senior_requests += 1
+            if control:
+                self.control_requests += 1
+            else:
+                self.senior_requests += 1
             self.since_senior = 0
             self.reviewed_results = sum(1 for _ in _results(messages))
         else:
@@ -545,4 +649,12 @@ def escalation_from_env(
             if os.environ.get("RPENT_ESCALATION_SENIOR_MAX_IMAGES")
             else None
         ),
+        plan_turn=os.environ.get("RPENT_ESCALATION_PLAN", "1") != "0",
+        plan_memory=(
+            load_plan_memory(plan_files.split(os.pathsep))
+            if (plan_files := os.environ.get("RPENT_ESCALATION_PLAN_FILES"))
+            else None
+        ),
+        takeover=int(os.environ.get("RPENT_ESCALATION_TAKEOVER", "0")),
+        max_takeovers=int(os.environ.get("RPENT_ESCALATION_MAX_TAKEOVERS", "4")),
     )
