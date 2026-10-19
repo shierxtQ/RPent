@@ -385,3 +385,28 @@ def test_qwen_settings_see_through_retry_wrapper(
     assert _build_model_settings(qwen, 64, "none")["extra_body"] == {
         "enable_thinking": False
     }
+
+
+def test_history_image_budget_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from rpent.planner.api_loop import _prune_history_images
+
+    frame = BinaryContent(data=b"x" * (3 * 1024 * 1024), media_type="image/png")
+    history = [
+        ModelRequest(parts=[UserPromptPart(content=["step", frame])]) for _ in range(4)
+    ]
+
+    def kept(messages: list[Any]) -> int:
+        return sum(
+            isinstance(item, BinaryContent)
+            for message in messages
+            for item in message.parts[0].content
+        )
+
+    monkeypatch.delenv("RPENT_MAX_HISTORY_IMAGE_MIB", raising=False)
+    assert kept(_prune_history_images(history)) == 2  # 4 MiB default, 2 newest kept
+    monkeypatch.setenv("RPENT_MAX_HISTORY_IMAGE_MIB", "10")
+    assert kept(_prune_history_images(history)) == 3
+    monkeypatch.setenv("RPENT_MAX_HISTORY_IMAGE_MIB", "0")
+    assert _prune_history_images(history) is history

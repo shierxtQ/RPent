@@ -27,6 +27,7 @@ import base64
 import contextlib
 import dataclasses
 import json
+import os
 import queue
 from collections import deque
 from collections.abc import Callable
@@ -70,6 +71,7 @@ _TEXT_LOG_LIMIT = 500
 _ARGS_LOG_LIMIT = 250
 _TOOL_LOG_LIMIT = 350
 #: Cap on cumulative decoded image bytes kept in the resent request history.
+#: ``RPENT_MAX_HISTORY_IMAGE_MIB`` overrides it; ``0`` keeps every image.
 _MAX_HISTORY_IMAGE_BYTES = 4 * 1024 * 1024
 
 #: Always retain at least this many of the most recent images, even if a single
@@ -669,6 +671,15 @@ def _build_model_settings(
     return settings
 
 
+def _history_image_budget() -> int | None:
+    """History image byte budget; ``None`` keeps every image."""
+    raw = os.environ.get("RPENT_MAX_HISTORY_IMAGE_MIB")
+    if raw is None or not raw.strip():
+        return _MAX_HISTORY_IMAGE_BYTES
+    mib = float(raw)
+    return None if mib <= 0 else int(mib * 1024 * 1024)
+
+
 def _prune_history_images(messages: list[ModelMessage]) -> list[ModelMessage]:
     """Drop old camera images so the resent request body stays bounded."""
     # Every image in history, oldest -> newest: (msg_idx, part_idx, item_idx, nbytes).
@@ -685,14 +696,15 @@ def _prune_history_images(messages: list[ModelMessage]) -> list[ModelMessage]:
                 ):
                     located.append((mi, pi, ii, len(item.data)))
 
-    if not located:
+    budget = _history_image_budget()
+    if not located or budget is None:
         return messages
 
     # Walk newest -> oldest, keeping images while under the byte budget.
     keep: set[tuple[int, int, int]] = set()
     total = 0
     for rank, (mi, pi, ii, nbytes) in enumerate(reversed(located)):
-        if rank < _MIN_RECENT_IMAGES or total + nbytes <= _MAX_HISTORY_IMAGE_BYTES:
+        if rank < _MIN_RECENT_IMAGES or total + nbytes <= budget:
             keep.add((mi, pi, ii))
             total += nbytes
 
