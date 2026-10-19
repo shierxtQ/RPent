@@ -479,6 +479,18 @@ def test_rejected_finish_item_is_not_promoted() -> None:
     assert "finish" in rendered
 
 
+def test_retried_stream_error_does_not_fail_the_run() -> None:
+    from rpent.planner.codex import _Recorder
+
+    recorder = _Recorder(max_turns=2, dashboard_events=RecordingSink())
+    error = {"error": {"message": "Reconnecting... 1/5"}, "will_retry": True}
+
+    assert "[codex-retry]" in recorder.observe({"method": "error", "payload": error})
+    assert recorder.error is None
+    recorder.observe({"method": "error", "payload": {**error, "will_retry": False}})
+    assert "Reconnecting" in recorder.error
+
+
 def test_fake_codex_backend_failure_stops_mcp_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

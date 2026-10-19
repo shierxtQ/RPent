@@ -274,6 +274,23 @@ class RoboCasaMemoryManager(MemoryManager):
             raise PermissionError(f"memory path escapes corpus root: {path}")
         if resolved.is_relative_to(self.root):
             return resolved.relative_to(self.root).as_posix()
+        return self._foreign_selected_path(path)
+
+    def _foreign_selected_path(self, path: str) -> str | None:
+        """Selected file named by a Windows-style rendering of its path, if any.
+
+        GPT-6 Astra behind some Codex relays rewrites the listed POSIX paths as
+        ``C:\\Users\\<user>\\...\\<corpus>\\task-specific\\<Task>.md`` or
+        ``/c/Users/<user>/...`` although Codex reports a Linux cwd and bash, so
+        every memory read fails. A missing path that ends with the corpus
+        folder and a selected file's relative path reads that file.
+        """
+        if Path(path).exists():
+            return None
+        normalized = path.replace("\\", "/")
+        for name in self.selection.selected:
+            if normalized.endswith(f"/{self.root.name}/{name}"):
+                return name
         return None
 
     def get_common_tool_bindings(self):
@@ -294,6 +311,8 @@ class RoboCasaMemoryManager(MemoryManager):
                     encoding="utf-8"
                 ) != self.selection.contents[relative]:
                     raise ValueError(f"memory changed during this run: {relative}")
+            if relative is not None:
+                path = str(self.root / relative)
             result = shared_read(path=path, max_chars=max_chars)
             if relative is not None and isinstance(result.get("content"), str):
                 content = result["content"]

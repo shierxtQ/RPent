@@ -255,6 +255,26 @@ def test_reads_are_optional_and_files_are_rechecked(tmp_path, make_corpus):
     )
 
 
+@pytest.mark.parametrize("style", ["drive", "msys"])
+def test_windows_style_paths_read_selected_memory(tmp_path, make_corpus, style):
+    from robots.robocasa.memory import RoboCasaMemoryManager, TaskMemory
+
+    root = make_corpus(tmp_path / "GPT_6_astra_high")
+    manager = RoboCasaMemoryManager(TaskMemory.load(root, "OpenDrawer"))
+    read = manager.get_common_tool_bindings()["read_text_file"][1]
+    name = manager.selection.selected[0]
+
+    def windows(corpus: str) -> str:
+        parts = ["Users", "someone", "projects", corpus, *name.split("/")]
+        if style == "drive":
+            return "C:\\" + "\\".join(parts)
+        return "/c/" + "/".join(parts)
+
+    assert read(path=windows(root.name))["content"] == manager.selection.contents[name]
+    assert name not in manager.unread_files
+    assert "error" in read(path=windows("another_corpus"))
+
+
 @pytest.mark.parametrize("reading", ["none", "partial", "complete"])
 def test_on_demand_reads_do_not_block_actions_or_finish(
     tmp_path, monkeypatch, make_corpus, reading

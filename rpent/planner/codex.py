@@ -655,7 +655,12 @@ class _Recorder:
         if "requestApproval" in method:
             return f"[codex-approval] {method}\n"
         if method in {"error", "fatal"}:
-            self.error = _short_json(_jsonable(payload), limit=500)
+            detail = _short_json(_jsonable(payload), limit=500)
+            if method == "error" and _get(payload, "will_retry", False):
+                # Codex reconnects a dropped response stream itself
+                # ("Reconnecting... 1/5"); only an error it gives up on ends the run.
+                return f"[codex-retry] {detail}\n"
+            self.error = detail
             return f"[codex-error] {self.error}\n"
         return ""
 
