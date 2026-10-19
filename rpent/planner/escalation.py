@@ -50,6 +50,12 @@ Optional mechanisms (off by default; each can be switched on alone):
   next K requests (reason ``control``) unless it starts a reply with
   ``[HAND BACK]``. ``RPENT_ESCALATION_MAX_TAKEOVERS`` (default 4) bounds the
   takeovers per run. Control turns are not counted against ``max_share``.
+- ``RPENT_ESCALATION_SENIOR_BACKEND=codex``: senior turns are turns of one
+  official Codex CLI thread per episode (``rpent/planner/codex_senior.py``;
+  ``RPENT_CODEX_BIN`` names the ``codex`` binary). The default backend is
+  ``api``. When the Codex senior gives no usable reply, a vetoed give-up
+  stands and otherwise the worker takes the request; the next senior turn
+  waits for the next escalation event.
 """
 
 from __future__ import annotations
@@ -79,6 +85,8 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
+
+from rpent.planner.codex_senior import SeniorUnavailable, codex_senior_from_env
 
 MOTION_TOOLS = frozenset(
     {
@@ -471,6 +479,8 @@ class EscalationModel(WrapperModel):
                     "latency_s": round(time.monotonic() - started, 3),
                     "error": f"{type(exc).__name__}: {exc}"[:2000],
                 }
+                # Tokens and backend details of failed Codex senior attempts.
+                | getattr(exc, "fields", {})
             )
             raise
         usage = response.usage
@@ -485,6 +495,8 @@ class EscalationModel(WrapperModel):
                     p.tool_name for p in response.parts if isinstance(p, ToolCallPart)
                 ],
             }
+            # Codex senior thread, turn, attempts and attached images.
+            | ((response.provider_details or {}).get("escalation_log") or {})
         )
         return response
 
@@ -495,6 +507,7 @@ class EscalationModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         reason = self._trigger(messages)
+        vetoed = None
         if reason is None:
             response = await self._call(
                 "worker", None, messages, model_settings, model_request_parameters
@@ -513,19 +526,43 @@ class EscalationModel(WrapperModel):
                 }
             )
             reason = "giveup"
+            vetoed = response
         else:
             proposal = None
 
         note = self._senior_note(reason, proposal)
         if reason == "plan" and self.plan_memory:
-            self._log({"request": self.requests + 1, "plan_memory_chars": len(self.plan_memory)})
-        response = await self._call(
-            "senior",
-            reason,
-            _append_note(messages, note),
-            model_settings,
-            model_request_parameters,
-        )
+            self._log(
+                {
+                    "request": self.requests + 1,
+                    "plan_memory_chars": len(self.plan_memory),
+                }
+            )
+        try:
+            response = await self._call(
+                "senior",
+                reason,
+                _append_note(messages, note),
+                model_settings,
+                model_request_parameters,
+            )
+        except SeniorUnavailable:
+            # Logged by _call. A vetoed give-up stands; otherwise the worker
+            # takes this request. Routing moves on as after a senior turn, so
+            # the senior is not asked again before the next event.
+            response = vetoed or await self._call(
+                "worker",
+                f"senior_unavailable_{reason}",
+                messages,
+                model_settings,
+                model_request_parameters,
+            )
+            self.planned = True
+            self.control_left = 0
+            self.requests += 1
+            self.since_senior = 0
+            self.reviewed_results = sum(1 for _ in _results(messages))
+            return response
         self.planned = True
         text = _reply_text(response)
         if reason == "control":
@@ -542,7 +579,11 @@ class EscalationModel(WrapperModel):
             self.takeovers += 1
             self.control_left = self.takeover
             self._log(
-                {"request": self.requests + 1, "takeover": self.takeovers, "after": reason}
+                {
+                    "request": self.requests + 1,
+                    "takeover": self.takeovers,
+                    "after": reason,
+                }
             )
         if not _has_tool_call(response):
             # A text-only reply would end the run; hand the guidance to the worker.
@@ -617,22 +658,33 @@ def escalation_from_env(
             "RPENT_ESCALATION=1 requires RPENT_ESCALATION_MODEL and a non-empty "
             "credential named by RPENT_ESCALATION_KEY_ENV"
         )
-    senior = retry_from_env(
-        prompt_cache_from_env(
-            build_api_model(
-                model_id,
-                os.environ.get("RPENT_ESCALATION_BASE_URL") or None,
-                api_key=os.environ[key_env],
+    base_url = os.environ.get("RPENT_ESCALATION_BASE_URL") or None
+    effort = os.environ.get("RPENT_ESCALATION_REASONING_EFFORT", "low")
+    backend = os.environ.get("RPENT_ESCALATION_SENIOR_BACKEND") or "api"
+    senior: Model
+    if backend == "codex":
+        senior = codex_senior_from_env(
+            model_id,
+            output_dir=output_dir,
+            base_url=base_url,
+            key_env=key_env,
+            reasoning_effort=effort,
+        )
+    elif backend == "api":
+        senior = retry_from_env(
+            prompt_cache_from_env(
+                build_api_model(model_id, base_url, api_key=os.environ[key_env])
             )
         )
-    )
+    else:
+        raise ValueError(
+            f"RPENT_ESCALATION_SENIOR_BACKEND must be api or codex, not {backend!r}"
+        )
     worker_settings: dict[str, Any] = {}
     if reasoning_effort == "none" and "qwen" in worker.model_name.lower():
         worker_settings["extra_body"] = {"enable_thinking": False}
     senior_settings = {
-        "openai_reasoning_effort": os.environ.get(
-            "RPENT_ESCALATION_REASONING_EFFORT", "low"
-        ),
+        "openai_reasoning_effort": effort,
         # Reasoning item ids do not survive turns written by the other model.
         "openai_send_reasoning_ids": False,
     }
