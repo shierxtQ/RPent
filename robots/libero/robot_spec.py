@@ -578,5 +578,15 @@ def _init_runtime(
         from rpent.runtime.perception_arbiter import SharedPerceptionArbiter
 
         runtime_kwargs["perception_arbiter"] = SharedPerceptionArbiter.from_env()
+        # RPENT_SHARED_SIM=1 (opt-in): parallel tasks on this host also take
+        # turns running their simulators, so each one steps at single-task
+        # speed; the queue wait is excluded from time budgets like perception.
+        if os.getenv("RPENT_SHARED_SIM", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            runtime_kwargs["shared_sim"] = True
 
     return list(owned_daemons.values()), runtime_kwargs

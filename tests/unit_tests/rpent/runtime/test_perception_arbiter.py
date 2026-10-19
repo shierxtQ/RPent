@@ -52,6 +52,34 @@ def test_shared_slot_serializes_clients(tmp_path):
     assert max(waits) >= 0.03
 
 
+def test_resources_queue_independently_and_report_waits(tmp_path):
+    path = tmp_path / "arbiter.sqlite3"
+    holder = SharedPerceptionArbiter(path, client_id="a", poll_s=0.01, stale_s=30)
+    waiter = SharedPerceptionArbiter(path, client_id="b", poll_s=0.01, stale_s=30)
+
+    with holder.hold("libero_sim"):
+        # Another resource is free while the simulator slot is held.
+        with waiter.hold("perception"):
+            pass
+        done = threading.Event()
+
+        def take_sim() -> None:
+            with waiter.hold("libero_sim"):
+                done.set()
+
+        thread = threading.Thread(target=take_sim)
+        thread.start()
+        time.sleep(0.1)
+        assert not done.is_set()
+    thread.join(timeout=5)
+
+    assert done.is_set()
+    by_resource = waiter.timing().as_dict()["wait_by_resource"]
+    assert set(by_resource) == {"perception", "libero_sim"}
+    assert by_resource["libero_sim"] >= 0.05
+    assert waiter.current_wait_s() >= by_resource["libero_sim"]
+
+
 def test_from_env_auto_joins_default_queue(monkeypatch, tmp_path):
     monkeypatch.delenv("RPENT_SHARED_PERCEPTION", raising=False)
     monkeypatch.delenv("RPENT_PERCEPTION_SCHEDULER_PATH", raising=False)

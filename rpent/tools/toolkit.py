@@ -29,6 +29,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -279,78 +280,93 @@ class Toolkit:
             self._active_operation = operation
 
         try:
-            started = time.perf_counter()
-            failed = False
-            time_limit_s = _tool_time_limit_s()
-            if time_limit_s > 0 and not _is_readonly(handler):
-                threading.Thread(
-                    target=self._watch_tool_time,
-                    args=(operation, time_limit_s),
-                    name=f"tool-time-{name}",
-                    daemon=True,
-                ).start()
-            try:
-                result = handler(**input_dict)
-            except TypeError as e:
-                result = {
-                    "error": f"bad arguments for {name}: {e}",
-                    "got": input_dict,
-                }
-                failed = True
-            except ToolCancelled as e:
-                if operation.timed_out:
-                    result = {
-                        "error": (
-                            f"{name} was stopped after {time_limit_s:g}s of execution "
-                            "(tool time limit); the state below is where it stopped. "
-                            "Continue from here."
-                        ),
-                        "code": "tool_timeout",
-                        "interrupted": True,
-                    }
-                else:
-                    result = {
-                        "error": str(e),
-                        "code": "tool_cancelled",
-                        "interrupted": True,
-                    }
-                failed = True
-            except Exception as e:
-                result = {"error": str(e), "traceback": traceback.format_exc()}
-                failed = True
-
-            if not _is_readonly(handler):
-                elapsed_s = round(time.perf_counter() - started, 2)
-                result_dict = result if isinstance(result, dict) else {"value": result}
-                command = {"action": name, **input_dict}
-                record: StepRecord | None = None
-                try:
-                    captured = self.get_env_state(
-                        command=command,
-                        result=result_dict,
-                        elapsed_s=elapsed_s,
-                    )
-                except Exception as e:
-                    captured = result_dict
-                    captured["state_capture_error"] = str(e)
-                    captured.setdefault(
-                        "error", f"failed to capture state after {name}: {e}"
-                    )
-                    captured.setdefault("traceback", traceback.format_exc())
-                else:
-                    record = self._state.latest_record()
-                result = captured
-                if failed:
-                    for key, value in result_dict.items():
-                        result.setdefault(key, value)
-                if record is not None:
-                    self._publish_step(record)
-
+            # A stateful tool runs the simulator (steps, renders, state capture)
+            # inside the optional shared env slot; the slot is taken before the
+            # tool clock starts, and its queue wait is excluded like perception.
+            env_slot = nullcontext() if _is_readonly(handler) else self.env_slot()
+            with env_slot:
+                result = self._run_tool(name, handler, input_dict, operation)
             return ToolResult(name=name, result=result)
         finally:
             with self._operation_lock:
                 self._active_operation = None
                 operation.done_event.set()
+
+    def _run_tool(
+        self,
+        name: str,
+        handler: Callable[..., Any],
+        input_dict: dict[str, Any],
+        operation: _ToolOperation,
+    ) -> Any:
+        """Run one handler and, for stateful tools, capture the new state."""
+        started = time.perf_counter()
+        failed = False
+        time_limit_s = _tool_time_limit_s()
+        if time_limit_s > 0 and not _is_readonly(handler):
+            threading.Thread(
+                target=self._watch_tool_time,
+                args=(operation, time_limit_s),
+                name=f"tool-time-{name}",
+                daemon=True,
+            ).start()
+        try:
+            result = handler(**input_dict)
+        except TypeError as e:
+            result = {
+                "error": f"bad arguments for {name}: {e}",
+                "got": input_dict,
+            }
+            failed = True
+        except ToolCancelled as e:
+            if operation.timed_out:
+                result = {
+                    "error": (
+                        f"{name} was stopped after {time_limit_s:g}s of execution "
+                        "(tool time limit); the state below is where it stopped. "
+                        "Continue from here."
+                    ),
+                    "code": "tool_timeout",
+                    "interrupted": True,
+                }
+            else:
+                result = {
+                    "error": str(e),
+                    "code": "tool_cancelled",
+                    "interrupted": True,
+                }
+            failed = True
+        except Exception as e:
+            result = {"error": str(e), "traceback": traceback.format_exc()}
+            failed = True
+
+        if not _is_readonly(handler):
+            elapsed_s = round(time.perf_counter() - started, 2)
+            result_dict = result if isinstance(result, dict) else {"value": result}
+            command = {"action": name, **input_dict}
+            record: StepRecord | None = None
+            try:
+                captured = self.get_env_state(
+                    command=command,
+                    result=result_dict,
+                    elapsed_s=elapsed_s,
+                )
+            except Exception as e:
+                captured = result_dict
+                captured["state_capture_error"] = str(e)
+                captured.setdefault(
+                    "error", f"failed to capture state after {name}: {e}"
+                )
+                captured.setdefault("traceback", traceback.format_exc())
+            else:
+                record = self._state.latest_record()
+            result = captured
+            if failed:
+                for key, value in result_dict.items():
+                    result.setdefault(key, value)
+            if record is not None:
+                self._publish_step(record)
+        return result
 
     def _publish_step(self, record: StepRecord) -> None:
         """Publish one recorded environment step to the dashboard sink."""
@@ -378,6 +394,14 @@ class Toolkit:
     def excluded_wait_s(self) -> float:
         """Return optional local-resource wait excluded from active budgets."""
         return 0.0
+
+    def env_slot(self) -> AbstractContextManager:
+        """Return the context a stateful tool runs the simulator in.
+
+        No-op by default; robot toolkits can serialize simulators that share
+        one host. Its queue wait must be included in :meth:`excluded_wait_s`.
+        """
+        return nullcontext()
 
     def resource_timing(self) -> dict[str, Any]:
         """Return optional resource timing for the run transcript."""

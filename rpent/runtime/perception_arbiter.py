@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +62,8 @@ class PerceptionTiming:
     scheduler_path: str | None
     queue_wait_s: float
     acquisitions: int
+    #: ``queue_wait_s`` split by resource (e.g. ``perception``, ``libero_sim``).
+    wait_by_resource: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -70,6 +72,9 @@ class PerceptionTiming:
             "scheduler_path": self.scheduler_path,
             "queue_wait_s": round(self.queue_wait_s, 6),
             "acquisitions": self.acquisitions,
+            "wait_by_resource": {
+                name: round(value, 6) for name, value in self.wait_by_resource.items()
+            },
         }
 
 
@@ -111,6 +116,7 @@ class SharedPerceptionArbiter:
         self.stale_s = max(30.0, float(stale_s))
         self._lock = threading.Lock()
         self._queue_wait_s = 0.0
+        self._wait_by_resource: dict[str, float] = {}
         self._acquisitions = 0
         self._active_wait_started: float | None = None
         self._init_db()
@@ -222,6 +228,9 @@ class SharedPerceptionArbiter:
             waited = time.perf_counter() - started
             with self._lock:
                 self._queue_wait_s += waited
+                self._wait_by_resource[resource] = (
+                    self._wait_by_resource.get(resource, 0.0) + waited
+                )
                 self._acquisitions += 1
                 self._active_wait_started = None
         return ticket_id
@@ -253,6 +262,7 @@ class SharedPerceptionArbiter:
     def timing(self) -> PerceptionTiming:
         with self._lock:
             waited = self._queue_wait_s
+            by_resource = dict(self._wait_by_resource)
             acquisitions = self._acquisitions
         return PerceptionTiming(
             enabled=True,
@@ -260,4 +270,5 @@ class SharedPerceptionArbiter:
             scheduler_path=str(self.path),
             queue_wait_s=waited,
             acquisitions=acquisitions,
+            wait_by_resource=by_resource,
         )
