@@ -387,6 +387,30 @@ def test_qwen_settings_see_through_retry_wrapper(
     }
 
 
+def test_qwen_settings_see_through_tool_args_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # RPENT_COERCE_TOOL_ARGS=1 wraps the planner model; without escalation the
+    # thinking switch must still reach a Qwen worker.
+    for name in ("ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.providers.openai import OpenAIProvider
+
+    from rpent.planner.api_loop import _build_model_settings
+    from rpent.planner.retry import RetryingModel
+    from rpent.planner.tool_args import ToolArgsRepairModel
+
+    provider = OpenAIProvider(base_url="http://localhost:1/v1", api_key="test")
+    qwen = ToolArgsRepairModel(
+        RetryingModel(OpenAIChatModel("qwen3.6-27b", provider=provider))
+    )
+
+    assert _build_model_settings(qwen, 64, "none")["extra_body"] == {
+        "enable_thinking": False
+    }
+
+
 def _text_then_finish(calls: list[int]):
     def model(messages: list[Any], info: Any) -> ModelResponse:
         calls.append(len(messages))
