@@ -6,8 +6,14 @@ correction memory (CORR_DIR/<tag>.md) is appended to every GPT-6 senior note; Qw
 sees it. After every episode GPT-6 reflects offline on its own interventions (trigger,
 situation, guidance, what followed, outcome) and edits the entries:
 
-- entries used in a successful episode, and entries written from one, become verified;
-- an entry used in two failed episodes without any success is dropped;
+- an entry counts as used only when the reflection reports that its situation arose and the
+  guidance applied its fix ("applied"); merely being shown does not count;
+- entries applied in a successful episode, and entries written or revised from one, become
+  verified;
+- an entry applied in two failed episodes without any success is dropped; a revised entry starts
+  its failure count again;
+- episodes whose transcript holds no planner turn (e.g. a planner timeout before the transcript
+  was written) are not reflected on and leave the memory untouched;
 - at most MAX_ENTRIES entries.
 
 A task runs at most 5 sessions x 3 attempts = 15 independent episodes and stops at its first
@@ -116,7 +122,8 @@ def digest(out: Path) -> dict:
             f"After:\n{after or ' (episode ended)'}"
         )
     finish = tr.get("finish") or {}
-    return {"interventions": len(seniors), "turns": len(turns), "finish": finish, "text": "\n\n".join(blocks)}
+    return {"interventions": len(seniors), "shown": len(blocks), "turns": len(turns), "finish": finish,
+            "text": "\n\n".join(blocks)}
 
 
 def task_language(out: Path) -> str:
@@ -155,9 +162,12 @@ worker was doing, what the state/images showed), the root cause, and the exact c
 record what went wrong for the worker and how to correct it. If the episode failed, say what your \
 guidance missed and revise or remove entries that did not help. Prefer revising an existing entry \
 over adding a near duplicate. Each field at most two sentences. At most {max_entries} entries in total.
+In "applied", list the ids of existing entries whose situation actually arose in this episode and \
+whose fix your guidance applied; leave out entries that were not relevant.
 
 Reply with JSON only:
-{{"add": [{{"trigger": "plan|checkin|errors|stall|giveup|any", "situation": "...", "diagnosis": "...", "fix": "..."}}],
+{{"applied": ["id", ...],
+ "add": [{{"trigger": "plan|checkin|errors|stall|giveup|any", "situation": "...", "diagnosis": "...", "fix": "..."}}],
  "revise": [{{"id": "...", "situation": "...", "diagnosis": "...", "fix": "..."}}],
  "remove": ["id", ...],
  "note": "one sentence on what this episode taught"}}"""
@@ -185,12 +195,12 @@ def parse_edits(text: str) -> dict:
     if not match:
         raise ValueError("no JSON object in reflection reply")
     edits = json.loads(match.group(0))
-    return {k: edits.get(k) or [] for k in ("add", "revise", "remove")} | {"note": edits.get("note", "")}
+    return {k: edits.get(k) or [] for k in ("applied", "add", "revise", "remove")} | {"note": edits.get("note", "")}
 
 
 def apply(entries: list[dict], edits: dict, episode: str, success: bool, used: set[str]) -> list[dict]:
     entries = [dict(e) for e in entries]
-    # Outcome bookkeeping for entries the senior saw in this episode.
+    # Outcome bookkeeping for entries the senior applied in this episode.
     for e in entries:
         if e["id"] in used:
             e["used_in"] = e.get("used_in", []) + [episode]
@@ -200,9 +210,11 @@ def apply(entries: list[dict], edits: dict, episode: str, success: bool, used: s
             else:
                 e["failures"] = e.get("failures", 0) + 1
     remove = set(edits["remove"])
+    revised = {str(r.get("id")) for r in edits["revise"]}
     entries = [
         e for e in entries
-        if e["id"] not in remove and not (e.get("failures", 0) >= FAILS_TO_DROP and not e.get("successes"))
+        if e["id"] not in remove
+        and (e["id"] in revised or not (e.get("failures", 0) >= FAILS_TO_DROP and not e.get("successes")))
     ]
     by_id = {e["id"]: e for e in entries}
     for r in edits["revise"]:
@@ -213,6 +225,7 @@ def apply(entries: list[dict], edits: dict, episode: str, success: bool, used: s
             if r.get(k):
                 e[k] = str(r[k])[:FIELD_CHARS]
         e["revised_in"] = e.get("revised_in", []) + [episode]
+        e["failures"] = 0  # the revised fix has not failed yet
         if success:
             e["status"] = "verified"
     stem, next_id = episode.rsplit("/", 1)[-1], 1  # ids name the writing episode: s2_a1.3
@@ -237,12 +250,14 @@ def reflect(out: Path, entries: list[dict], rule: dict, success: bool, episode: 
         rec = json.loads(cached.read_text())
         return rec["entries_after"], rec
     d = digest(out)
-    used = {e["id"] for e in entries} if d["interventions"] else set()
     rec = {"episode": episode, "success": success, "interventions": d["interventions"],
-           "entries_before": entries, "used": sorted(used)}
+           "entries_before": entries, "used": []}
+    none = {"applied": [], "add": [], "revise": [], "remove": []}
     if d["interventions"] == 0:
-        rec |= {"skipped": "no senior intervention", "edits": {"add": [], "revise": [], "remove": []},
-                "entries_after": apply(entries, {"add": [], "revise": [], "remove": []}, episode, success, used)}
+        rec |= {"skipped": "no senior intervention", "edits": none, "entries_after": entries}
+    elif d["shown"] == 0:
+        rec |= {"skipped": f"no planner turn in the transcript ({d['turns']} turns)", "edits": none,
+                "entries_after": entries}
     else:
         prompt = PROMPT.format(
             language=task_language(out) or "(see task memory)", rule=json.dumps(rule),
@@ -255,8 +270,9 @@ def reflect(out: Path, entries: list[dict], rule: dict, success: bool, episode: 
         try:
             edits = parse_edits(reply)
         except ValueError as exc:
-            edits = {"add": [], "revise": [], "remove": [], "note": f"unparsed reply: {exc}"}
-        rec |= {"prompt_chars": len(prompt), "usage": usage, "reply": reply, "edits": edits,
+            edits = none | {"note": f"unparsed reply: {exc}"}
+        used = {str(i) for i in edits["applied"]} & {e["id"] for e in entries}
+        rec |= {"prompt_chars": len(prompt), "usage": usage, "reply": reply, "edits": edits, "used": sorted(used),
                 "entries_after": apply(entries, edits, episode, success, used)}
     rec["at"] = datetime.now(timezone.utc)
     write_json(cached, rec)

@@ -30,15 +30,6 @@ if [ "${PLANNER_MODE:-escalation}" = codex ]; then
   export CODEX_HOME=/mnt/user_dir/hanjinchen/lijinhao/duanyun/codex-home-rpent
   export CODEX_BASE_URL="${CODEX_BASE_URL_OVERRIDE:-$RPENT_BASE_URL}" CODEX_API_KEY="$RPENT_API_KEY"
   MODEL_ARGS=(--planner codex --model gpt-6-astra --reasoning-effort low)
-elif [ "${PLANNER_MODE:-escalation}" = codex-escalation ] || [ "${PLANNER_MODE:-escalation}" = codex-qwen ]; then
-  # codex-qwen: Qwen alone inside the Codex harness (no senior turns).
-  [ "$PLANNER_MODE" = codex-qwen ] && export RPENT_ESCALATION_WORKER_ONLY=1
-  # Codex harness with Qwen as the worker and GPT-6 Astra (Codex model) as the senior.
-  export CODEX_HOME=/mnt/user_dir/hanjinchen/lijinhao/duanyun/codex-home-rpent
-  export CODEX_BASE_URL="${CODEX_BASE_URL_OVERRIDE:-$RPENT_BASE_URL}" CODEX_API_KEY="$RPENT_API_KEY"
-  export RPENT_ESCALATION_WORKER_MODEL=qwen3.6-27b RPENT_ESCALATION_WORKER_BASE_URL="$(v1 "$INFINI_BASE_URL")" \
-    RPENT_ESCALATION_WORKER_KEY_ENV=INFINI_API_KEY
-  MODEL_ARGS=(--planner codex --model gpt-6-astra --reasoning-effort low)
 elif [ "${PLANNER_MODE:-escalation}" = gpt ]; then
   unset RPENT_ESCALATION
   export OPENAI_API_KEY="$RPENT_API_KEY"
