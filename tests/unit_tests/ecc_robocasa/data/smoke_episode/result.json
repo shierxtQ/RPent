@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.1",
+  "protocol_id": "robocasa-harness-vla-v2",
+  "evaluation_split": "atomic",
+  "task_name": "CloseToasterOvenDoor",
+  "environment_split": "target",
+  "seed": 1,
+  "valid": true,
+  "success": true,
+  "success_source": "state.success",
+  "termination_reason": "completed",
+  "elapsed_s": 200.7,
+  "planner": {
+    "backend": "api",
+    "model": "openai-chat:qwen3.6-27b",
+    "reasoning_effort": "none",
+    "max_turns": 100
+  },
+  "runtime": {
+    "cell_timeout_seconds": 1800,
+    "rldx_max_chunks": 40,
+    "rldx_settle_patience": 999,
+    "rldx_action_steps_per_chunk": 8
+  },
+  "memory": {
+    "policy": "task-global",
+    "selected_files": [
+      "task-specific/CloseToasterOvenDoor_s0.json",
+      "task-specific/CloseToasterOvenDoor_s0_recipe.jsonl",
+      "task-specific/CloseToasterOvenDoor.md",
+      "global/GLOBAL_MEMORY.md"
+    ],
+    "missing_layers": [],
+    "profile": "local",
+    "task_family": {},
+    "read_files": [
+      "task-specific/CloseToasterOvenDoor.md"
+    ],
+    "audit_status": "ok"
+  }
+}

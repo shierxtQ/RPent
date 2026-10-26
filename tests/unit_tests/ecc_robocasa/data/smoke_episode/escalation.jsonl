@@ -1,0 +1,6 @@
+{"request": 1, "role": "worker", "reason": null, "model": "qwen3.6-27b", "latency_s": 2.891, "input_tokens": 7449, "cached_input_tokens": 0, "output_tokens": 49, "tools": ["view_env_state"]}
+{"request": 2, "role": "worker", "reason": null, "model": "qwen3.6-27b", "latency_s": 4.553, "input_tokens": 8309, "cached_input_tokens": 0, "output_tokens": 87, "tools": ["read_text_file"]}
+{"request": 3, "role": "senior", "reason": "plan", "model": "gpt-6-astra", "latency_s": 35.061, "input_tokens": 7272, "cached_input_tokens": 0, "output_tokens": 156, "tools": ["back_project_batch"]}
+{"request": 4, "role": "worker", "reason": null, "model": "qwen3.6-27b", "latency_s": 3.502, "input_tokens": 10124, "cached_input_tokens": 0, "output_tokens": 125, "tools": ["rldx_arm"]}
+{"request": 5, "role": "worker", "reason": null, "model": "qwen3.6-27b", "latency_s": 14.8, "input_tokens": 11295, "cached_input_tokens": 0, "output_tokens": 242, "tools": ["write_text_file"]}
+{"request": 6, "role": "worker", "reason": null, "model": "qwen3.6-27b", "latency_s": 2.133, "input_tokens": 11623, "cached_input_tokens": 0, "output_tokens": 72, "tools": ["finish"]}

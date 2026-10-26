@@ -1,0 +1,139 @@
+{
+  "run_artifacts": [
+    "CloseToasterOvenDoor_target_s1_recipe.jsonl",
+    "episode.mp4",
+    "success_criteria.md"
+  ],
+  "steps": [
+    {
+      "step_idx": 0,
+      "state": {
+        "robot0_eef_pos": [
+          3.457198667479608,
+          -0.5736623401506386,
+          1.30081979217628
+        ],
+        "robot0_eef_quat": [
+          0.6660979630503402,
+          0.7322479649835105,
+          0.0931107074432701,
+          -0.10703652440689523
+        ],
+        "robot0_gripper_qpos": [
+          0.02055052244133506,
+          -0.020516032054768756
+        ],
+        "robot0_base_pos": [
+          3.4608176293627717,
+          -0.8228094652361997,
+          0.7000000383350744
+        ],
+        "robot0_base_quat": [
+          0.0,
+          0.0,
+          0.7071068286895752,
+          0.7071066498756409
+        ]
+      },
+      "terminated": false,
+      "truncated": false,
+      "artifacts": [
+        "agentview.png",
+        "agentview_depth.npz",
+        "agentview_metadata.json",
+        "agentview_world.npz",
+        "navview.png",
+        "navview_floor.png",
+        "navview_world.npz",
+        "wrist.png",
+        "wrist_depth.npz",
+        "wrist_metadata.json",
+        "wrist_world.npz"
+      ],
+      "extras": {
+        "task_language": "Close the toaster oven door.",
+        "success": false,
+        "task_progress": {},
+        "vla_desync": true
+      }
+    },
+    {
+      "step_idx": 1,
+      "state": {
+        "robot0_eef_pos": [
+          3.17014098361057,
+          -0.31700787609714415,
+          1.227215278902772
+        ],
+        "robot0_eef_quat": [
+          0.8621480028912355,
+          0.14248387836736184,
+          0.2827241786446,
+          -0.3955580922263955
+        ],
+        "robot0_gripper_qpos": [
+          0.04010322500749184,
+          -0.0395465989875314
+        ],
+        "robot0_base_pos": [
+          3.4540376742110017,
+          -0.8430395472095438,
+          0.702562173728352
+        ],
+        "robot0_base_quat": [
+          0.0,
+          0.0,
+          0.7281641364097595,
+          0.6854028105735779
+        ]
+      },
+      "terminated": true,
+      "truncated": false,
+      "artifacts": [
+        "agentview.png",
+        "agentview_depth.npz",
+        "agentview_metadata.json",
+        "agentview_world.npz",
+        "navview.png",
+        "navview_floor.png",
+        "navview_world.npz",
+        "wrist.png",
+        "wrist_depth.npz",
+        "wrist_metadata.json",
+        "wrist_world.npz"
+      ],
+      "command": {
+        "action": "rldx_arm",
+        "prompt": "Close the toaster oven door."
+      },
+      "result": {
+        "ok": true,
+        "prompt": "Close the toaster oven door.",
+        "status": "success",
+        "chunks": 29,
+        "steps_applied": 232,
+        "grasped": false,
+        "grasp_detected": false,
+        "grasp_contact": false,
+        "held_apart": false,
+        "grasp_obj": null,
+        "gripper_qpos": 0.04,
+        "peak_lift": 0.239,
+        "base_clip": 0.1,
+        "base_drift": 0.021,
+        "effective_prompt": "Close the toaster oven door.",
+        "effective_max_chunks": 40,
+        "effective_n_action_steps": 8,
+        "effective_settle_patience": 999,
+        "prompt_overridden": false
+      },
+      "elapsed_s": 120.37,
+      "extras": {
+        "task_language": "Close the toaster oven door.",
+        "success": true,
+        "task_progress": {},
+        "vla_desync": false
+      }
+    }
+  ]
+}
