@@ -91,6 +91,17 @@ def test_plan_goes_to_senior_once_then_worker_continues():
     assert (model.requests, model.senior_requests) == (3, 1)
 
 
+def test_plan_turn_can_be_disabled_and_checkin_still_runs():
+    model, worker, senior = build(
+        lambda m: call("move_to"), lambda m: call("segment"), plan=False, checkin=2
+    )
+
+    assert ask(model, READY).parts[0].tool_name == "move_to"
+    assert ask(model, READY).parts[0].tool_name == "move_to"
+    assert ask(model, READY).parts[0].tool_name == "segment"
+    assert "periodic review" in senior.notes[0]
+
+
 def test_worker_giveup_is_vetoed_and_senior_decides():
     model, worker, senior = build(
         lambda m: call("finish", status="failure", summary="cannot grasp"),
@@ -191,3 +202,33 @@ def test_senior_tools_keep_object_root_while_worker_keeps_relaxed_schema():
     asyncio.run(model.request(READY, None, params))
 
     assert seen == {"worker": ["object", "string"], "senior": "object"}
+
+
+def test_errors_trigger_waits_for_the_configured_run_of_errors():
+    failing = READY + [result("move_to", {"error": "ik failed"}, i) for i in range(3, 6)]
+    for errors, expected in ((4, "move_to"), (3, "segment")):
+        model, worker, senior = build(
+            lambda m: call("move_to"),
+            lambda m: call("segment"),
+            max_share=1.0,
+            errors=errors,
+        )
+        model.planned = True
+        assert ask(model, failing).parts[0].tool_name == expected
+    assert "returned errors" in senior.notes[0]
+
+
+def test_corrections_reach_every_senior_note_but_not_the_worker():
+    model, worker, senior = build(
+        lambda m: call("move_to"),
+        lambda m: call("segment"),
+        checkin=1,
+        max_share=1.0,
+        corrections="- plate slips on carry: lift 8 cm before moving",
+    )
+
+    for _ in range(3):
+        ask(model, READY)
+    assert len(senior.notes) == 2
+    assert all("lift 8 cm" in note for note in senior.notes)
+    assert not any("lift 8 cm" in note for note in worker.notes)

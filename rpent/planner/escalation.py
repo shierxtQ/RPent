@@ -20,7 +20,7 @@ shares the same conversation and takes the next request only when:
 
 - ``plan``: memory and the initial state have been read (or at request 6);
 - ``stall``: the last four motion results moved the end effector < 1 cm;
-- ``errors``: the last two tool results reported an error;
+- ``errors``: the last ``errors`` tool results (default 2) reported an error;
 - ``checkin``: the worker has made ``checkin`` requests since the senior;
 - ``giveup``: the worker proposed ``finish`` without success. Its reply is
   dropped and the senior decides that turn (at most ``max_vetoes`` times).
@@ -30,7 +30,11 @@ shares the same conversation and takes the next request only when:
 ``RPENT_ESCALATION_MODEL``, ``RPENT_ESCALATION_BASE_URL``,
 ``RPENT_ESCALATION_KEY_ENV``, ``RPENT_ESCALATION_REASONING_EFFORT`` (default
 ``low``), ``RPENT_ESCALATION_CHECKIN`` (default 12) and
-``RPENT_ESCALATION_MAX_SHARE`` (default 0.2). Every request is logged to
+``RPENT_ESCALATION_MAX_SHARE`` (default 0.2); ``RPENT_ESCALATION_PLAN=0``
+skips the ``plan`` turn; ``RPENT_ESCALATION_ERRORS`` (default 2) sets how many
+consecutive tool errors trigger the senior; ``RPENT_CLOUD_CORRECTIONS`` names a
+file (the task's cloud correction memory) appended to every senior note and never
+shown to the worker. Every request is logged to
 ``escalation.jsonl`` in the run output directory.
 """
 
@@ -214,10 +218,13 @@ class EscalationModel(WrapperModel):
         checkin: int = 12,
         max_share: float = 0.2,
         max_vetoes: int = 3,
+        plan: bool = True,
+        errors: int = 2,
+        corrections: str = "",
         log_path: Path | None = None,
     ) -> None:
         super().__init__(worker)
-        if checkin < 1 or not 0 < max_share <= 1 or max_vetoes < 0:
+        if checkin < 1 or not 0 < max_share <= 1 or max_vetoes < 0 or errors < 1:
             raise ValueError("invalid escalation budget")
         self.senior = senior
         self.worker_settings = worker_settings or {}
@@ -225,11 +232,14 @@ class EscalationModel(WrapperModel):
         self.checkin = checkin
         self.max_share = max_share
         self.max_vetoes = max_vetoes
+        self.errors = errors
+        self.corrections = corrections.strip()
         self.log_path = log_path
         self.requests = 0
         self.senior_requests = 0
         self.since_senior = 0
-        self.planned = False
+        # Without a plan turn, the senior first joins on another event.
+        self.planned = not plan
         self.vetoes = 0
         # Tool results already reviewed by the senior do not trigger again.
         self.reviewed_results = 0
@@ -255,7 +265,9 @@ class EscalationModel(WrapperModel):
             center = [sum(axis) / len(window) for axis in zip(*window)]
             if max(math.dist(p, center) for p in window) < STALL_SPAN_M:
                 return "stall"
-        if len(fresh) >= 2 and all("error" in r for _, r in fresh[-2:]):
+        if len(fresh) >= self.errors and all(
+            "error" in r for _, r in fresh[-self.errors :]
+        ):
             return "errors"
         if self.since_senior >= self.checkin:
             return "checkin"
@@ -276,6 +288,12 @@ class EscalationModel(WrapperModel):
             "sentences for the worker, then make the next tool call yourself. Do not "
             "reply with text only."
         )
+        if self.corrections:
+            note += (
+                "\nCloud correction memory for this task (your diagnoses and fixes from "
+                "earlier episodes; apply an entry only when its situation matches):\n"
+                + self.corrections
+            )
         if proposal is not None:
             summary = str(proposal.get("summary", ""))[:1200]
             note += (
@@ -335,6 +353,8 @@ class EscalationModel(WrapperModel):
             "reason": reason,
             "model": model.model_name,
         }
+        if senior and self.corrections:
+            record["corrections_chars"] = len(self.corrections)
         try:
             response = await model.request(
                 self._labeled(messages),
@@ -453,6 +473,12 @@ class EscalationModel(WrapperModel):
             stream.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
+def _read_corrections(path: str | None) -> str:
+    if not path or not Path(path).is_file():
+        return ""
+    return Path(path).read_text(encoding="utf-8")
+
+
 def escalation_from_env(
     worker: Model, *, output_dir: str | Path, reasoning_effort: str
 ) -> Model:
@@ -496,5 +522,8 @@ def escalation_from_env(
         senior_settings=senior_settings,
         checkin=int(os.environ.get("RPENT_ESCALATION_CHECKIN", "12")),
         max_share=float(os.environ.get("RPENT_ESCALATION_MAX_SHARE", "0.2")),
+        plan=os.environ.get("RPENT_ESCALATION_PLAN", "1") != "0",
+        errors=int(os.environ.get("RPENT_ESCALATION_ERRORS", "2")),
+        corrections=_read_corrections(os.environ.get("RPENT_CLOUD_CORRECTIONS")),
         log_path=Path(output_dir) / "escalation.jsonl",
     )

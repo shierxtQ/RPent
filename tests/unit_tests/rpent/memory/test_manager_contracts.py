@@ -465,3 +465,67 @@ def test_evidence_merge_tolerates_list_attempts_and_scalar_seeds(
     assert metadata["evidence"]["cells"] == ["goal_swap_t1_s0", "spatial_task_t0_s0"]
     assert metadata["confidence"] == "probable"
 
+
+def test_replace_mode_swaps_in_the_solved_cells_own_task_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_MEMORY_MERGE_REPLACE", "1")
+    memory_dir = tmp_path / "memory"
+    output_dir = tmp_path / "run"
+    cell = "10_task_t2_s0"
+    family = memory_dir / "task-family" / "task-family_libero10_task_t2.md"
+    _write_memory_leaf(
+        family,
+        memory_id="task-family_libero10_task_t2",
+        scope="task-family",
+        cells=[cell],  # the inherited write-up already credits this cell
+        body="Inherited write-up.\n",
+    )
+    task_dir = memory_dir / "task-specific"
+    task_dir.mkdir(parents=True)
+    (task_dir / f"{cell}.json").write_text('{"by": "cloud"}')
+    (task_dir / f"{cell}_recipe.jsonl").write_text('{"action":"pi0_pick"}\n')
+    _write_memory_leaf(
+        memory_dir / "_internal" / "inbox" / cell / f"task-family_{cell}_draft.md",
+        memory_id="family",
+        scope="task-family",
+        cells=[cell],
+        body="Own write-up.\n",
+    )
+    _write_task_pair(output_dir, cell, solved=True)
+
+    result = MemoryManager(memory_dir).merge_memory(
+        cell_tag=cell, run_state_dir=output_dir, solved=True
+    )
+
+    assert result["replaced"] == 2 and result["task"] == 1
+    assert family.read_text().endswith("Own write-up.\n")
+    assert json.loads((task_dir / f"{cell}.json").read_text()) == {
+        "libero_terminated": True
+    }
+    archive = memory_dir / "_internal" / "replaced"
+    assert (archive / f"task-family_libero10_task_t2__before_{cell}.md").read_text().endswith(
+        "Inherited write-up.\n"
+    )
+    assert json.loads((archive / cell / f"{cell}.json").read_text()) == {"by": "cloud"}
+
+
+def test_replace_mode_keeps_inherited_task_memory_for_unsolved_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_MEMORY_MERGE_REPLACE", "1")
+    memory_dir = tmp_path / "memory"
+    output_dir = tmp_path / "run"
+    cell = "10_task_t9_s0"
+    task_dir = memory_dir / "task-specific"
+    task_dir.mkdir(parents=True)
+    (task_dir / f"{cell}.json").write_text('{"by": "cloud"}')
+    (task_dir / f"{cell}_recipe.jsonl").write_text('{"action":"pi0_pick"}\n')
+    _write_task_pair(output_dir, cell, solved=False)
+
+    result = MemoryManager(memory_dir).merge_memory(
+        cell_tag=cell, run_state_dir=output_dir, solved=False
+    )
+
+    assert "replaced" not in result and result["task"] == 0
+    assert json.loads((task_dir / f"{cell}.json").read_text()) == {"by": "cloud"}

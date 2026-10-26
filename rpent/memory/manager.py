@@ -242,6 +242,12 @@ class MemoryManager:
         Drafts merge into global/task-family; conflicting prose is
         archived under _internal/conflicts. Solved audit/recipe pairs are
         copied to task-specific/. MEMORY.md is refreshed at the end.
+
+        With ``RPENT_MEMORY_MERGE_REPLACE=1``, a solved cell's own
+        task-family write-up and audit/recipe pair replace the ones already
+        published for it (the previous files move to _internal/replaced), so
+        an explorer seeded with another model's corpus ends up with its own
+        task memory. Global notes merge as usual.
         """
         self.check_layout()
         root = self._root
@@ -250,6 +256,8 @@ class MemoryManager:
         inbox = internal / "inbox" / cell_tag
         conflicts = internal / "conflicts"
         merged = internal / "merged"
+        replaced = internal / "replaced"
+        replace = solved and os.environ.get("RPENT_MEMORY_MERGE_REPLACE") == "1"
         tiers = {
             "global": root / "global",
             "task-family": root / "task-family",
@@ -267,6 +275,8 @@ class MemoryManager:
             "conflicts": 0,
             "skipped": [],
         }
+        if replace:
+            result["replaced"] = 0
         lock_path = internal / "merge.lock"
         lock_path.touch(exist_ok=True)
         with lock_path.open("r+") as lock_file:
@@ -299,6 +309,15 @@ class MemoryManager:
                         f"{destination.name} left untouched"
                     )
                     continue
+                if replace and metadata["scope"] == "task-family":
+                    replaced.mkdir(parents=True, exist_ok=True)
+                    shutil.move(
+                        str(destination),
+                        str(replaced / f"{memory_id}__before_{cell_tag}.md"),
+                    )
+                    destination.write_text(_render(metadata, body))
+                    result["replaced"] += 1
+                    continue
                 credited = cell_tag in (
                     (old_metadata.get("evidence") or {}).get("cells") or []
                 )
@@ -323,6 +342,14 @@ class MemoryManager:
             if solved and audit.exists() and recipe.exists():
                 audit_target = tiers["task"] / audit.name
                 recipe_target = tiers["task"] / recipe.name
+                if replace and audit_target.exists() and recipe_target.exists():
+                    archive = replaced / cell_tag
+                    if archive.exists():
+                        shutil.rmtree(archive)
+                    archive.mkdir(parents=True)
+                    shutil.move(str(audit_target), str(archive / audit.name))
+                    shutil.move(str(recipe_target), str(archive / recipe.name))
+                    result["replaced"] += 1
                 if not audit_target.exists() and not recipe_target.exists():
                     shutil.copy2(audit, audit_target)
                     shutil.copy2(recipe, recipe_target)
