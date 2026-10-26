@@ -30,6 +30,25 @@ and never counted. Every valid episode's ``escalation.jsonl`` must show the
 rule's plan switch, K, N and the corrections it was launched with; a mismatch
 makes the launch an infrastructure error and stops new launches.
 
+``stage3.parallel_attempts = true`` (default false: the order above, as
+run_ecc_stage3) runs the attempts of a session at the same time: all of them
+with the memory as it was when the session started. Once every episode of the
+session is final (invalid ones relaunched under the caps first), its valid
+episodes are reflected on one after another in a fixed order (a1, a2, a3),
+each reflection editing the memory the previous one left, and the next
+session starts with the result. The task stops after the first session with a
+valid success, all of whose valid episodes are reflected on. An id a
+reflection lists in ``applied`` counts as used only if that episode was shown
+the entry as it now stands (an entry an earlier reflection of the same session
+wrote or revised was not), so an entry is never verified or failed by an
+episode that did not see it. The
+scheduler starts a session only when all its attempts can launch (free slots
+and endpoint capacity for all of them) and launches its remaining attempts
+before anything else, one launch stagger apart, so they start as one block;
+relaunches of started sessions come next, then new sessions in the order
+(session, task), so every task's first session is started before any second
+session.
+
 When every task is final, the product is frozen: ``product/final/<Task>.md``
 (verified entries only, rendered as run_ecc_stage3 does; empty when none) for every task,
 with a hashed manifest. Dry run by default (prints the plan); ``run --go``
@@ -68,6 +87,8 @@ S3_DEFAULTS: dict[str, Any] = {
     "seed": 12,
     "sessions": R.SESSIONS,
     "attempts_per_session": R.ATTEMPTS,
+    # true: a session's attempts run at once with the session's memory, reflected on in order after it
+    "parallel_attempts": False,
     "tasks": [],  # empty: all 50 Target50 tasks in manifest order
     "s1_product": "",  # <runs>/s1_full/product (verified with stage1.verify)
     # The frozen stage-2 product folder (<S2 run>/product), verified with stage2.verify; or, for
@@ -167,6 +188,8 @@ def validate(cfg: Mapping[str, Any]) -> None:
     for key in ("sessions", "attempts_per_session"):
         if not isinstance(s3[key], int) or s3[key] < 1:
             raise ValueError(f"stage3.{key} must be a positive integer")
+    if not isinstance(s3["parallel_attempts"], bool):
+        raise ValueError("stage3.parallel_attempts must be true or false")
     for key in ("infra_retries", "render_retries"):
         if not isinstance(s3[key], int) or s3[key] < 0:
             raise ValueError(f"stage3.{key} must be a nonnegative integer")
@@ -201,6 +224,19 @@ def reflection_model(cfg: Mapping[str, Any]) -> tuple[str, str]:
     )
 
 
+def experiment_settings(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``[stage3]`` values that define the experiment.
+
+    ``parallel_attempts`` is listed only when on, so a sequential run's
+    settings and hash are what they were before the switch existed.
+    """
+    s3 = cfg["stage3"]
+    out = {k: s3[k] for k in EXPERIMENT_KEYS}
+    if s3["parallel_attempts"]:
+        out["parallel_attempts"] = True
+    return out
+
+
 def experiment_hash(cfg: Mapping[str, Any]) -> str:
     s3 = cfg["stage3"]
     return C.canonical_hash(
@@ -209,7 +245,7 @@ def experiment_hash(cfg: Mapping[str, Any]) -> str:
             # K comes from the task's rule, not senior.checkin.
             "senior": {k: v for k, v in cfg["senior"].items() if k != "checkin"},
             "episode": cfg["episode"],
-            "stage3": {k: s3[k] for k in EXPERIMENT_KEYS},
+            "stage3": experiment_settings(cfg),
             "reflection": {k: s3["reflection"][k] for k in REFLECTION_EXPERIMENT_KEYS},
         }
     )
@@ -348,7 +384,8 @@ def job_id(task: str, name: str) -> str:
 
 
 class Stage3(C.Stage):
-    """One job per (task, episode); episode e+1 waits for episode e's reflection."""
+    """One job per (task, episode); episode e+1 waits for episode e's reflection
+    (parallel sessions: session s+1 waits for every reflection of session s)."""
 
     name = STAGE
 
@@ -368,6 +405,8 @@ class Stage3(C.Stage):
         self.seed = int(cfg["stage3"]["seed"])
         self.budget = budget(cfg)
         self.attempts = int(cfg["stage3"]["attempts_per_session"])
+        self.sessions = int(cfg["stage3"]["sessions"])
+        self.parallel = bool(cfg["stage3"]["parallel_attempts"])
         self.settings = settings(cfg)
         self.refl = cfg["stage3"]["reflection"]
         self.code_dir = Path(cfg["paths"].get("code_dir") or REPO_ROOT)
@@ -422,10 +461,27 @@ class Stage3(C.Stage):
     def budget_launches(self) -> int:
         return len(self._jobs)
 
+    # -- sessions (parallel mode) ---------------------------------------------
+
+    def session_of(self, e: int) -> int:
+        return e // self.attempts
+
+    def session_episodes(self, s: int) -> range:
+        return range(s * self.attempts, (s + 1) * self.attempts)
+
+    def session_started(
+        self, task: str, e: int, states: Mapping[str, Mapping[str, Any]]
+    ) -> bool:
+        """Whether any episode of ``e``'s session has been launched."""
+        return any(
+            states[job_id(task, self.name_of(p))].get("tries")
+            for p in self.session_episodes(self.session_of(e))
+        )
+
     # -- the correction memory chain ----------------------------------------
 
     def entries_before(self, task: str, e: int) -> list[dict[str, Any]]:
-        """The memory episode ``e`` runs with: the previous reflection's ``entries_after``."""
+        """The memory reflection ``e`` edits: the previous reflection's ``entries_after``."""
         if e == 0:
             return []
         record = C.read_json(self.reflection_path(task, e - 1))
@@ -433,16 +489,40 @@ class Stage3(C.Stage):
             raise RuntimeError(f"{task} {self.name_of(e - 1)} has no reflection record")
         return list(record["entries_after"])
 
+    def memory_used(self, task: str, e: int) -> list[dict[str, Any]]:
+        """The memory episode ``e`` runs with: ``entries_before(e)``, or with parallel sessions
+        the memory at the start of its session (the previous session's last reflection)."""
+        if not self.parallel:
+            return self.entries_before(task, e)
+        return self.entries_before(task, self.session_of(e) * self.attempts)
+
+    def shown_ids(self, task: str, e: int) -> set[str] | None:
+        """Ids of the entries episode ``e`` was shown as they still stand, when that can
+        differ from the memory its reflection edits (parallel sessions: entries an earlier
+        reflection of the session wrote or revised were not shown); None otherwise."""
+        if not self.parallel:
+            return None
+        now = {str(x["id"]): x for x in self.entries_before(task, e)}
+        keys = ("trigger", *R.ENTRY_FIELDS)
+        return {
+            str(x["id"])
+            for x in self.memory_used(task, e)
+            if str(x["id"]) in now
+            and all(now[str(x["id"])].get(k) == x.get(k) for k in keys)
+        }
+
     def prepare_try(self, job: C.Job, n: int) -> None:
         """Freeze the memory for the episode (try 1) and check it before every launch.
 
         The snapshot must equal the rendering of the previous reflection's
-        entries; RPent silently ignores a missing corrections file, so its
-        presence, sha256 and size are checked and logged here.
+        entries (parallel sessions: of the previous session's last reflection);
+        RPent silently ignores a missing corrections file, so its presence,
+        sha256 and size are checked and logged here.
         """
         task, e = job.task, job.meta["episode"]
         path = self.snapshot(task, e)
-        text = R.render_file(self.entries_before(task, e))
+        memory = self.memory_used(task, e)
+        text = R.render_file(memory)
         if not path.exists():
             if n != 1 and (self.episode_dir(task, e) / "try1").exists():
                 raise RuntimeError(f"{path} vanished after try 1 launched")
@@ -454,6 +534,7 @@ class Stage3(C.Stage):
         info = corrections_info(path)
         episode = self.episode_dir(task, e) / "episode.json"
         if not episode.exists():
+            first = self.session_of(e) * self.attempts
             C.atomic_write_json(
                 episode,
                 {
@@ -465,7 +546,16 @@ class Stage3(C.Stage):
                     "rule": self.rules[task].as_json(),
                     "rung": rung_of(self.rules[task]),
                     "corrections": {"path": str(path), **info},
-                    "entries": len(self.entries_before(task, e)),
+                    "entries": len(memory),
+                    **(
+                        {
+                            "session": self.session_of(e) + 1,
+                            # the reflection whose entries_after the session runs with
+                            "memory_from": self.name_of(first - 1) if first else None,
+                        }
+                        if self.parallel
+                        else {}
+                    ),
                     "created_at": C.now_iso(),
                 },
             )
@@ -533,17 +623,23 @@ class Stage3(C.Stage):
     # -- readiness, progress -------------------------------------------------
 
     def ready(self, job: C.Job, states: Mapping[str, Mapping[str, Any]]) -> bool:
-        """Episode e launches once e-1 is a valid failure whose reflection is written."""
+        """Episode e launches once e-1 is a valid failure whose reflection is written
+        (parallel sessions: once every episode of the previous session is)."""
         e = job.meta["episode"]
         if self.record_path(job.task).exists():
             return False
-        if e == 0:
-            return True
-        prev = states[job_id(job.task, self.name_of(e - 1))]
-        final = prev.get("final")
-        if not final or final.get("class") != "valid" or final.get("success"):
-            return False
-        return self.reflection_path(job.task, e - 1).exists()
+        if self.parallel:
+            s = self.session_of(e)
+            previous = self.session_episodes(s - 1) if s else range(0)
+        else:
+            previous = range(e - 1, e) if e else range(0)
+        for p in previous:
+            final = states[job_id(job.task, self.name_of(p))].get("final")
+            if not final or final.get("class") != "valid" or final.get("success"):
+                return False
+            if not self.reflection_path(job.task, p).exists():
+                return False
+        return True
 
     def tick(self, states: Mapping[str, Mapping[str, Any]]) -> None:
         """Start, poll and apply reflections; finalize tasks that are done."""
@@ -586,6 +682,8 @@ class Stage3(C.Stage):
     def _scan(self, task: str, states: Mapping[str, Mapping[str, Any]]) -> tuple | None:
         """``("final", status, last)``, ``("reflect", task, e, state)``, or None (an episode is
         queued or running)."""
+        if self.parallel:
+            return self._scan_sessions(task, states)
         for e in range(self.budget):
             state = states[job_id(task, self.name_of(e))]
             final = state.get("final")
@@ -599,6 +697,34 @@ class Stage3(C.Stage):
                 return ("reflect", task, e, state)
             if final.get("success"):
                 return ("final", "solved", e)
+        return ("final", "unsolved", self.budget - 1)
+
+    def _scan_sessions(
+        self, task: str, states: Mapping[str, Mapping[str, Any]]
+    ) -> tuple | None:
+        """:meth:`_scan` for parallel sessions: nothing happens to a session until every
+        episode of it is final; then its reflections run in episode order, one at a time,
+        and the task stops after the session if any of its episodes succeeded validly. An
+        episode out of relaunches stops the task there (``requeue`` reruns it; the later
+        episodes of the session are reflected on after it)."""
+        for s in range(self.sessions):
+            episodes = list(self.session_episodes(s))
+            finals = [
+                states[job_id(task, self.name_of(e))].get("final") for e in episodes
+            ]
+            if all(f and f.get("class") == "not_needed" for f in finals):
+                continue
+            if not all(finals):
+                return None
+            for e, final in zip(episodes, finals):
+                if final.get("class") == "not_needed":
+                    continue
+                if final.get("class") != "valid":
+                    return ("final", "infra_exhausted", e)
+                if not self.reflection_path(task, e).exists():
+                    return ("reflect", task, e, states[job_id(task, self.name_of(e))])
+            if any(f.get("class") == "valid" and f.get("success") for f in finals):
+                return ("final", "solved", episodes[-1])
         return ("final", "unsolved", self.budget - 1)
 
     # -- reflections ---------------------------------------------------------
@@ -631,7 +757,9 @@ class Stage3(C.Stage):
         try_dir = self.final_try_dir(state)
         before = self.entries_before(task, e)
         snapshot = self.snapshot(task, e)
-        if snapshot.read_text(encoding="utf-8") != R.render_file(before):
+        if snapshot.read_text(encoding="utf-8") != R.render_file(
+            self.memory_used(task, e)
+        ):
             raise RuntimeError(f"{snapshot} does not match the previous reflection")
         d = R.digest(try_dir, self.settings)
         outcome = C.read_outcome(try_dir)
@@ -804,7 +932,14 @@ class Stage3(C.Stage):
             }
         else:
             text = str(reply.get("text") or "")
-            done = R.reviewed(before, text, base["episode"], success, self.settings)
+            done = R.reviewed(
+                before,
+                text,
+                base["episode"],
+                success,
+                self.settings,
+                shown=self.shown_ids(task, e),
+            )
             record = {
                 **base,
                 **call,
@@ -875,7 +1010,7 @@ class Stage3(C.Stage):
         success: bool,
         before: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        return {
+        base = {
             "episode": f"{task}/{self.name_of(e)}",
             "index": e,
             "success": success,
@@ -888,6 +1023,11 @@ class Stage3(C.Stage):
             "digest_source": d["source"],
             "entries_before": before,
         }
+        if self.parallel:
+            base["session"] = self.session_of(e) + 1
+            # the ids the episode ran with (its session's memory): only these can count as used
+            base["session_memory"] = [str(x["id"]) for x in self.memory_used(task, e)]
+        return base
 
     def write_reflection(
         self, task: str, e: int, record: dict[str, Any], rstate: dict[str, Any]
@@ -925,6 +1065,14 @@ class Stage3(C.Stage):
                 "reply": record.get("reply"),
                 "edits": record.get("edits"),
                 "used": record.get("used"),
+                **(
+                    {
+                        "session_memory": record.get("session_memory"),
+                        "applied_not_shown": record.get("applied_not_shown"),
+                    }
+                    if self.parallel
+                    else {}
+                ),
                 "entries_before": record["entries_before"],
                 "entries_after": after,
                 "usd": record.get("usd", 0.0),
@@ -1041,6 +1189,14 @@ class Stage3(C.Stage):
         record["usd"]["total"] = round(
             record["usd"]["episodes"] + record["usd"]["reflections"], 4
         )
+        if self.parallel:
+            launched = [
+                self.session_of(e)
+                for e in range(self.budget)
+                if states[job_id(task, self.name_of(e))].get("tries")
+            ]
+            record["parallel_attempts"] = True
+            record["sessions_run"] = max(launched) + 1 if launched else 0
         C.atomic_write_json(self.record_path(task), record)
         C.append_jsonl(
             self.layout.progress,
@@ -1197,6 +1353,8 @@ class Stage3Scheduler(C.Scheduler):
         self._last_total_check = 0.0
         self._total_usd = 0.0
         self._config_checked: set[str] = set()
+        #: The slot limit last reported as too low for a session (parallel sessions).
+        self._session_wait_noted: int | None = None
         #: Episodes and reflections together (stage3.cost_ceiling_usd, else the scheduler's);
         #: the base guard's episode-only cost check is replaced by :meth:`guard`.
         self.cost_ceiling = float(
@@ -1234,8 +1392,69 @@ class Stage3Scheduler(C.Scheduler):
                 job.order,
             )
 
+        if self.stage.parallel:  # type: ignore[attr-defined]
+            return self._next_in_sessions(states, candidates, key, len(busy))
         candidates.sort(key=key)
         return candidates[0].job_id if candidates else None
+
+    def _next_in_sessions(
+        self,
+        states: Mapping[str, Mapping[str, Any]],
+        candidates: list[C.Job],
+        key: Any,
+        running: int,
+    ) -> str | None:
+        """Parallel sessions: the rest of a started session first: its attempts not launched
+        yet (a session that started with all its slots free launches as one block), then
+        relaunches in the base order (infra, killed, render); a new session only when all
+        its attempts fit now, in the order (session, task)."""
+        stage: Stage3 = self.stage  # type: ignore[assignment]
+        started = [
+            j
+            for j in candidates
+            if stage.session_started(j.task, j.meta["episode"], states)
+        ]
+        if started:
+
+            def rest_first(job: C.Job) -> tuple[int, ...]:
+                if not states[job.job_id]["tries"]:
+                    return (0, job.order)
+                return (1, *key(job))
+
+            return min(started, key=rest_first).job_id
+        if not candidates:
+            return None
+
+        def order(job: C.Job) -> tuple[int, int]:
+            return (stage.session_of(job.meta["episode"]), job.order)
+
+        if not any(ep.up for ep in self.servers.endpoints):
+            # Nothing can launch; returning a job lets the loop see that no endpoint is up.
+            return min(candidates, key=order).job_id
+        need = stage.attempts
+        limit = self.slot_limit()
+        if limit < need:
+            if self._session_wait_noted != limit:
+                self._session_wait_noted = limit
+                note = f"concurrency {limit} is below the {need} attempts of a session: no session starts"
+                self.log({"event": "session_wait", "reason": note})
+                print(f"{C.now_iso()} {note}", flush=True)
+            return None
+        self._session_wait_noted = None
+        if min(limit - running, self.free_endpoint_slots(states)) < need:
+            return None
+        return min(candidates, key=order).job_id
+
+    def free_endpoint_slots(self, states: Mapping[str, Mapping[str, Any]]) -> int:
+        """Free slots on the endpoints that are up."""
+        load: dict[str, int] = {}
+        for _, last in self.running(states):
+            load[last.get("endpoint")] = load.get(last.get("endpoint"), 0) + 1
+        return sum(
+            max(0, ep.slots - load.get(ep.name, 0))
+            for ep in self.servers.endpoints
+            if ep.up
+        )
 
     def _mismatch(
         self, job_id: str, last: Mapping[str, Any], problems: list[str], when: str
@@ -1340,7 +1559,8 @@ class Stage3Scheduler(C.Scheduler):
 
 
 def chain_problems(stage: Stage3, task: str) -> list[str]:
-    """The task's memory chain: each snapshot renders the previous reflection's entries."""
+    """The task's memory chain: each reflection edits the previous reflection's entries, and
+    each snapshot renders them (parallel sessions: the entries at the start of its session)."""
     problems = []
     rows = []
     history = stage.corrections_dir(task) / "history.jsonl"
@@ -1352,7 +1572,10 @@ def chain_problems(stage: Stage3, task: str) -> list[str]:
         ]
     recorded = {row["episode"]: row.get("reflection_json_sha256") for row in rows}
     previous: list[dict[str, Any]] = []
+    session_memory: list[dict[str, Any]] = []
     for e in range(stage.budget):
+        if e % stage.attempts == 0:
+            session_memory = previous
         path = stage.reflection_path(task, e)
         snapshot = stage.snapshot(task, e)
         if not path.exists():
@@ -1362,11 +1585,19 @@ def chain_problems(stage: Stage3, task: str) -> list[str]:
             problems.append(
                 f"{stage.name_of(e)}: entries_before differ from the previous entries_after"
             )
+        ran_with = session_memory if stage.parallel else previous
         if snapshot.exists() and snapshot.read_text(encoding="utf-8") != R.render_file(
-            previous
+            ran_with
         ):
             problems.append(
-                f"{stage.name_of(e)}: corrections_used.md is not the previous memory"
+                f"{stage.name_of(e)}: corrections_used.md is not "
+                + ("its session's memory" if stage.parallel else "the previous memory")
+            )
+        if stage.parallel and not set(record.get("used") or []) <= {
+            str(x["id"]) for x in ran_with
+        }:
+            problems.append(
+                f"{stage.name_of(e)}: entries counted as used that the episode was not shown"
             )
         if recorded.get(record.get("episode")) not in (None, C.sha256_file(path)):
             problems.append(
@@ -1634,6 +1865,7 @@ def task_overview(
             "usd_episodes": 0.0,
             "usd_reflections": 0.0,
             "rule": stage.rules[task].as_json(),
+            "running_episodes": 0,
         }
         for e in range(stage.budget):
             state = states[job_id(task, stage.name_of(e))]
@@ -1646,6 +1878,11 @@ def task_overview(
             )
             if tries and tries[-1].get("status") in ("launching", "running"):
                 row["episode"], row["status"] = stage.name_of(e), "running"
+                row["running_episodes"] += 1
+                if stage.parallel:  # the session and how many of its episodes run
+                    row["episode"] = (
+                        f"s{stage.session_of(e) + 1} ({row['running_episodes']})"
+                    )
             if final.get("class") == "valid":
                 row["valid"] += 1
                 row["solved"] = row["solved"] or bool(final.get("success"))
@@ -1742,6 +1979,22 @@ def format_status(
         f"  correction entries: {tot['entries']} in the current memories, {tot['verified']} verified; "
         f"errors trigger fired {tot['errors_trigger']} times in {tot['valid']} valid episodes"
     )
+    if stage.parallel:
+        running = [r for r in rows.values() if r["running_episodes"]]
+        lines.append(
+            f"  parallel sessions ({stage.attempts} attempts at once): {len(running)} running "
+            f"({sum(r['running_episodes'] for r in running)} episodes), "
+            f"{sum(r['status'] == 'queued' for r in rows.values())} tasks queued (a session starts "
+            f"when {stage.attempts} slots are free)"
+        )
+        try:
+            limit = int(stage.layout.concurrency.read_text().strip())
+        except (OSError, ValueError):
+            limit = None
+        if limit is not None and limit < stage.attempts:
+            lines.append(
+                f"  NOTE: concurrency {limit} is below {stage.attempts}: no new session starts"
+            )
     lines.append(
         f"  cost so far (list price): episodes ${tot['usd_episodes']:.2f} + reflections "
         f"${tot['usd_reflections']:.2f} = ${tot['usd_episodes'] + tot['usd_reflections']:.2f}"
@@ -1814,6 +2067,15 @@ def make_manifest(
             "max_turns": cfg["episode"]["max_turns"],
             "infra_retries_per_episode": cfg["stage3"]["infra_retries"],
             "render_retries_per_episode": cfg["stage3"]["render_retries"],
+            **(
+                {
+                    "parallel_attempts": True,
+                    "stop": "the first session with a valid success, after all its "
+                    "episodes are reflected on",
+                }
+                if cfg["stage3"]["parallel_attempts"]
+                else {}
+            ),
         },
         "reflection": {
             "model": model,
@@ -1824,7 +2086,7 @@ def make_manifest(
                 if k not in ("model", "reasoning_effort")
             },
         },
-        "settings": {k: cfg["stage3"][k] for k in EXPERIMENT_KEYS},
+        "settings": experiment_settings(cfg),
         "inputs": dict(inputs),
         "tasks": [
             {
@@ -1927,6 +2189,15 @@ def print_plan(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
         f"single-shot episodes per task; stop at the first valid success; planner time "
         f"{ {s: timeout_for(cfg, s) for s in C.SPLITS} } s, {cfg['episode']['max_turns']} turns"
     )
+    if s3["parallel_attempts"]:
+        print(
+            f"  sessions parallel: the {s3['attempts_per_session']} attempts of a session run at once with the "
+            "memory at the session's start; when all are final, their reflections run in order (a1, a2, ...), "
+            "each on the memory the previous one left, and the next session starts with the result; the task "
+            "stops after the first session with a valid success (all its episodes reflected on); an applied id "
+            "counts as used only if the episode was shown it. A session starts only when all its attempts fit "
+            f"(--concurrency counts episodes: use a multiple of {s3['attempts_per_session']})"
+        )
     print(
         f"  retries  infra {s3['infra_retries']}, render {s3['render_retries']} per episode (never counted, never reflected on)"
     )
@@ -2038,6 +2309,14 @@ def build(
     return Stage3(cfg, layout, tasks, rules, Path(s1["corpus"])), fresh, inputs
 
 
+def drain_limit_s(stage: Stage3) -> float:
+    """How long a runner that stopped launching waits for the last reflections: one call's
+    timeout plus 300 s, times the attempts of a session with parallel sessions (a session's
+    reflections run one after another)."""
+    one = float(stage.refl["timeout_s"]) + 300
+    return one * (stage.attempts if stage.parallel else 1)
+
+
 def drain_reflections(
     stage: Stage3, scheduler: Stage3Scheduler, limit_s: float
 ) -> None:
@@ -2104,6 +2383,18 @@ def cmd_run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
         )
     layout = run_layout(cfg, args)
     stage, fresh, _ = build(cfg, args, layout)
+    if stage.parallel:
+        sched_max = int(cfg["scheduler"]["max_slots"])
+        for what, value in (
+            ("--concurrency", args.concurrency),
+            ("max slots", min(args.max_slots or sched_max, sched_max)),
+            ("endpoint slots", sum(ep.slots for ep in C.endpoints_from_config(cfg))),
+        ):
+            if value < stage.attempts and (value or what != "--concurrency"):
+                raise SystemExit(
+                    f"{what} {value} is below the {stage.attempts} attempts of a session: with "
+                    "parallel sessions no session could start (the concurrency counts episodes)"
+                )
     lock = C.acquire_lock(layout)  # noqa: F841 - held for the process lifetime
     if layout.manifest.exists():
         manifest = C.read_json(layout.manifest)
@@ -2191,9 +2482,7 @@ def cmd_run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
             layout.progress, {"event": "end", "result": result, "running": len(still)}
         )
     # The last episodes' reflections run on after the scheduler stopped launching.
-    drain_reflections(
-        stage, scheduler, float(cfg["stage3"]["reflection"]["timeout_s"]) + 300
-    )
+    drain_reflections(stage, scheduler, drain_limit_s(stage))
     if not scheduler.running(scheduler.all_states()):
         stage.unlock()
     print(f"runner finished: {result}", flush=True)
@@ -2210,6 +2499,10 @@ def load_stage(
     manifest = C.read_json(layout.manifest)
     if manifest is None:
         raise SystemExit(f"no run at {layout.root}")
+    # The run's own mode, whatever the config says now (a resume in the other mode is refused).
+    parallel = bool((manifest.get("settings") or {}).get("parallel_attempts"))
+    if parallel != cfg["stage3"]["parallel_attempts"]:
+        cfg = {**cfg, "stage3": {**cfg["stage3"], "parallel_attempts": parallel}}
     tasks = [(t["split"], t["task"]) for t in manifest["tasks"]]
     rules = {t["task"]: H.Rule.from_json(t["rule"]) for t in manifest["tasks"]}
     return (

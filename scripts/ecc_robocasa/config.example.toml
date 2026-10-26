@@ -134,6 +134,7 @@ s2_product = "/path/to/robocasa/ecc/s2_full/product"   # frozen stage-2 product 
 tasks = []                                    # empty: all 50 Target50 tasks
 sessions = 5                                  # 5 x 3 = 15 single-shot episodes per task; the first valid success stops
 attempts_per_session = 3
+parallel_attempts = false                     # true: a session's attempts run at once with the session's memory, reflected on in order after it
 infra_retries = 2                             # per episode; never counted, never reflected on
 render_retries = 6
 cost_ceiling_usd = 0                          # episodes + reflections (0: scheduler.cost_ceiling_usd)

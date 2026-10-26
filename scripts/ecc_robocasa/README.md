@@ -319,6 +319,26 @@ bookkeeping, ported from `scripts/ecc/run_ecc_stage3.py`), `reflect_call.sh` and
 | RoboCasa changes | tool results show their outcome first (skill, `ok`/`status`/`error`, `task_progress`, ...) before anything is clipped; an episode cut by the planner timeout is rebuilt from `run.log` with robot results from `states.json`; the prompt describes RoboCasa and names the termination reason |
 | Invalid episodes | relaunched under `stage3.infra_retries` / `stage3.render_retries`, never reflected on and never counted; a task whose episode exhausts them stops (`requeue --task T` reruns it) |
 | Cost guard | `stage3.cost_ceiling_usd` over episodes and reflections (else `scheduler.cost_ceiling_usd`) |
+| Parallel sessions | `stage3.parallel_attempts = true` (default false: the order above) runs the attempts of a session at once, all with the memory at the session's start; see below |
+
+**Parallel sessions** (`stage3.parallel_attempts = true`). The attempts of a session (`s<k>_a1` ..
+`s<k>_a<n>`) run at the same time, all with the memory as it was when the session started (their
+`corrections_used.md` are identical). Once every episode of the session is final, invalid ones
+relaunched first under the same caps, GPT-6 reflects on its valid episodes one after another in
+label order (`a1`, `a2`, ...), each reflection editing the memory the previous one left; the next
+session starts with the result. The task stops after the first session with a valid success,
+whose episodes are all reflected on first. The digest, prompt, skips, refusals and `apply` are
+unchanged, with one rule the order requires: an id a reflection lists in `applied` counts as used
+only if that episode was shown the entry as it still stands (an entry an earlier reflection of the
+same session wrote or revised was not), so an entry is never verified or failed by an episode
+that did not see it; the others are recorded as `applied_not_shown`. Scheduling: a session starts
+only when the concurrency limit and the endpoints' free slots fit all its attempts (so
+`--concurrency` should be a multiple of the attempts), its remaining attempts launch before
+anything else (one block, a launch stagger apart), relaunches of started sessions come next, and
+new sessions start in the order (session, task): every task's first session before any second
+one. A run keeps the mode it was created in: a resume in the other mode is refused (the switch is
+in the experiment hash only when on, so sequential runs keep their hash), and `status`, `freeze`
+and `requeue` read the mode from the run's manifest.
 
 ```bash
 S=/path/to/ecc-code/scripts/ecc_robocasa/stage3.py

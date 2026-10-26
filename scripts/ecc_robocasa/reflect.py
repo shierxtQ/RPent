@@ -53,7 +53,7 @@ import ast
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -781,19 +781,31 @@ def reviewed(
     episode: str,
     success: bool,
     settings: Settings = Settings(),
+    shown: Collection[str] | None = None,
 ) -> dict[str, Any]:
-    """Edits, used ids and the memory after one reply (run_ecc_stage3.reflect after the call)."""
+    """Edits, used ids and the memory after one reply (run_ecc_stage3.reflect after the call).
+
+    ``shown`` (stage 3's parallel sessions) is the ids of the memory the episode
+    ran with when that differs from ``entries``: an id listed in ``applied``
+    counts as used only if the episode was shown it, and the others are
+    returned as ``applied_not_shown``. Without it, as run_ecc_stage3, where the
+    two memories are the same.
+    """
     try:
         edits = parse_edits(reply)
         status = "applied"
     except ValueError as exc:
         edits = dict(NO_EDITS, note=f"unparsed reply: {exc}")
         status = "unparsed"
-    used = {str(i) for i in edits["applied"]} & {e["id"] for e in entries}
+    listed = {str(i) for i in edits["applied"]} & {e["id"] for e in entries}
+    used = listed if shown is None else listed & set(shown)
     after = apply(entries, edits, episode, success, used, settings)
-    return {
+    out = {
         "status": status,
         "edits": edits,
         "used": sorted(used),
         "entries_after": after,
     }
+    if shown is not None:
+        out["applied_not_shown"] = sorted(listed - used)
+    return out
