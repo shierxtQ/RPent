@@ -245,3 +245,23 @@ def test_perception_slot_uses_shared_arbiter(tmp_path: Path) -> None:
     robot_toolkit._primitives = primitives
     assert robot_toolkit.excluded_wait_s() == primitives.perception_wait_s()
     assert robot_toolkit.resource_timing() == {"perception": timing}
+
+
+def test_sim_slot_is_opt_in_and_uses_the_shared_queue(tmp_path: Path) -> None:
+    from contextlib import nullcontext
+
+    from rpent.runtime.perception_arbiter import SharedPerceptionArbiter
+
+    arbiter = SharedPerceptionArbiter(tmp_path / "arbiter.sqlite3")
+    assert isinstance(_primitives(perception_arbiter=arbiter).sim_slot(), nullcontext)
+    assert isinstance(_primitives(shared_sim=True).sim_slot(), nullcontext)
+
+    primitives = _primitives(perception_arbiter=arbiter, shared_sim=True)
+    robot_toolkit = object.__new__(toolkit.LiberoToolkit)
+    robot_toolkit._primitives = primitives
+    with robot_toolkit.env_slot():
+        pass
+
+    timing = primitives.perception_timing()
+    assert timing["acquisitions"] == 1
+    assert set(timing["wait_by_resource"]) == {"libero_sim"}

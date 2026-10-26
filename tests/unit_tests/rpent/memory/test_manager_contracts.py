@@ -30,7 +30,7 @@ def _write_memory_leaf(
     memory_id: str,
     scope: str,
     cells: list[str],
-    attempts: int = 1,
+    attempts: int | list[int] = 1,
     body: str = "Contract body.\n",
 ) -> None:
     metadata: dict[str, Any] = {
@@ -439,3 +439,93 @@ def test_memory_manager_refuses_to_complete_an_existing_partial_task_pair(
     assert result["task"] == 0
     assert result["skipped"] == ["incomplete existing task audit/recipe pair"]
     assert not (task_dir / f"{cell}_recipe.jsonl").exists()
+
+
+def test_evidence_merge_tolerates_list_attempts_and_scalar_seeds(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    manager = MemoryManager(memory_dir)
+    for cell, attempts in (("goal_swap_t1_s0", 2), ("spatial_task_t0_s0", [3])):
+        _write_memory_leaf(
+            memory_dir / "_internal" / "inbox" / cell / "new_global_strategy_x.md",
+            memory_id="shared-lesson",
+            scope="global",
+            cells=[cell],
+            attempts=attempts,
+            body=f"Prose from {cell}.\n",
+        )
+        manager.merge_memory(cell_tag=cell, run_state_dir=output_dir, solved=False)
+
+    published = memory_dir / "global" / "shared-lesson.md"
+    metadata = yaml.safe_load(published.read_text().split("---", 2)[1])
+    assert metadata["evidence"]["attempts"] == 5
+    assert metadata["evidence"]["cells"] == ["goal_swap_t1_s0", "spatial_task_t0_s0"]
+    assert metadata["confidence"] == "probable"
+
+
+def test_replace_mode_swaps_in_the_solved_cells_own_task_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_MEMORY_MERGE_REPLACE", "1")
+    memory_dir = tmp_path / "memory"
+    output_dir = tmp_path / "run"
+    cell = "10_task_t2_s0"
+    family = memory_dir / "task-family" / "task-family_libero10_task_t2.md"
+    _write_memory_leaf(
+        family,
+        memory_id="task-family_libero10_task_t2",
+        scope="task-family",
+        cells=[cell],  # the inherited write-up already credits this cell
+        body="Inherited write-up.\n",
+    )
+    task_dir = memory_dir / "task-specific"
+    task_dir.mkdir(parents=True)
+    (task_dir / f"{cell}.json").write_text('{"by": "cloud"}')
+    (task_dir / f"{cell}_recipe.jsonl").write_text('{"action":"pi0_pick"}\n')
+    _write_memory_leaf(
+        memory_dir / "_internal" / "inbox" / cell / f"task-family_{cell}_draft.md",
+        memory_id="family",
+        scope="task-family",
+        cells=[cell],
+        body="Own write-up.\n",
+    )
+    _write_task_pair(output_dir, cell, solved=True)
+
+    result = MemoryManager(memory_dir).merge_memory(
+        cell_tag=cell, run_state_dir=output_dir, solved=True
+    )
+
+    assert result["replaced"] == 2 and result["task"] == 1
+    assert family.read_text().endswith("Own write-up.\n")
+    assert json.loads((task_dir / f"{cell}.json").read_text()) == {
+        "libero_terminated": True
+    }
+    archive = memory_dir / "_internal" / "replaced"
+    assert (archive / f"task-family_libero10_task_t2__before_{cell}.md").read_text().endswith(
+        "Inherited write-up.\n"
+    )
+    assert json.loads((archive / cell / f"{cell}.json").read_text()) == {"by": "cloud"}
+
+
+def test_replace_mode_keeps_inherited_task_memory_for_unsolved_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_MEMORY_MERGE_REPLACE", "1")
+    memory_dir = tmp_path / "memory"
+    output_dir = tmp_path / "run"
+    cell = "10_task_t9_s0"
+    task_dir = memory_dir / "task-specific"
+    task_dir.mkdir(parents=True)
+    (task_dir / f"{cell}.json").write_text('{"by": "cloud"}')
+    (task_dir / f"{cell}_recipe.jsonl").write_text('{"action":"pi0_pick"}\n')
+    _write_task_pair(output_dir, cell, solved=False)
+
+    result = MemoryManager(memory_dir).merge_memory(
+        cell_tag=cell, run_state_dir=output_dir, solved=False
+    )
+
+    assert "replaced" not in result and result["task"] == 0
+    assert json.loads((task_dir / f"{cell}.json").read_text()) == {"by": "cloud"}

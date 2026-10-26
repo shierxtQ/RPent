@@ -702,6 +702,44 @@ def test_tool_time_limit_variable_overrides_the_toolkit_default(
     assert toolkit.execute_tool("rldx_skill", {}).result["code"] == "tool_timeout"
 
 
+def test_stateful_tools_run_and_capture_inside_env_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RPENT_TOOL_TIMEOUT_S", "0.3")
+    events: list[str] = []
+
+    class Slot:
+        def __enter__(self):
+            events.append("enter")
+            time.sleep(0.6)  # queued longer than the tool limit: not counted
+
+        def __exit__(self, *exc):
+            events.append("exit")
+
+    class Serialized(_ContractToolkit):
+        def env_slot(self):
+            return Slot()
+
+        def get_env_state(self, **kwargs: Any) -> dict[str, Any]:
+            events.append("capture")
+            return super().get_env_state(**kwargs)
+
+    toolkit = Serialized(tmp_path)
+
+    def move_to() -> dict[str, Any]:
+        events.append("run")
+        return {"arrived": True}
+
+    toolkit.add_tool("move_to", {"name": "move_to"}, move_to)
+    toolkit.add_tool("look", {"name": "look"}, readonly(lambda: {"seen": True}))
+
+    assert toolkit.execute_tool("move_to", {}).result == {"observation": 1}
+    assert events == ["enter", "run", "capture", "exit"]
+    events.clear()
+    assert toolkit.execute_tool("look", {}).result == {"seen": True}
+    assert events == []
+
+
 def test_tool_time_limit_can_be_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

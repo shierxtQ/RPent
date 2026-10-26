@@ -21,6 +21,7 @@ LIBERO primitives (``move_to``, ``pi0_pick``, ``release``, ...) on top.
 from __future__ import annotations
 
 import json
+from contextlib import AbstractContextManager, nullcontext
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,6 +36,12 @@ if TYPE_CHECKING:
     from rpent.memory.manager import MemoryManager
 
 logger = get_logger("libero_toolkit")
+
+
+def _sim_slot(primitives: Any) -> AbstractContextManager:
+    """The primitives' shared simulator slot; no-op for stand-in primitives."""
+    slot = getattr(primitives, "sim_slot", None)
+    return slot() if slot is not None else nullcontext()
 
 
 class LiberoToolkit(Toolkit):
@@ -194,8 +201,12 @@ class LiberoToolkit(Toolkit):
         return self._primitives
 
     def excluded_wait_s(self) -> float:
-        """Time waiting for shared perception, excluded from active budgets."""
+        """Time waiting for shared perception/simulator, excluded from budgets."""
         return self._primitives.perception_wait_s()
+
+    def env_slot(self):
+        """Run a stateful tool inside the optional host-wide simulator slot."""
+        return _sim_slot(self._primitives)
 
     def resource_timing(self) -> dict[str, Any]:
         """Return local shared-resource accounting for this episode."""
@@ -213,10 +224,11 @@ class LiberoToolkit(Toolkit):
             check_cancelled=self.raise_if_cancelled,
             **runtime_kwargs,
         )
-        primitives.reset()
-        primitives.start_recording()
-        self._action_frame_cursor = primitives.recorded_frame_count()
-        record = libero_tools.dump_state(primitives, self._state, log=None)
+        with _sim_slot(primitives):
+            primitives.reset()
+            primitives.start_recording()
+            self._action_frame_cursor = primitives.recorded_frame_count()
+            record = libero_tools.dump_state(primitives, self._state, log=None)
         self._primitives = primitives
         self._publish_step(record)
 

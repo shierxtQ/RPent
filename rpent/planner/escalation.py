@@ -20,7 +20,7 @@ shares the same conversation and takes the next request only when:
 
 - ``plan``: memory and the initial state have been read (or at request 6);
 - ``stall``: the last four motion results moved the end effector < 1 cm;
-- ``errors``: the last two tool results reported an error;
+- ``errors``: the last ``errors`` tool results (default 2) reported an error;
 - ``checkin``: the worker has made ``checkin`` requests since the senior;
 - ``giveup``: the worker proposed ``finish`` without success. Its reply is
   dropped and the senior decides that turn (at most ``max_vetoes`` times).
@@ -30,8 +30,12 @@ shares the same conversation and takes the next request only when:
 ``RPENT_ESCALATION_MODEL``, ``RPENT_ESCALATION_BASE_URL``,
 ``RPENT_ESCALATION_KEY_ENV``, ``RPENT_ESCALATION_REASONING_EFFORT`` (default
 ``low``), ``RPENT_ESCALATION_CHECKIN`` (default 12) and
-``RPENT_ESCALATION_MAX_SHARE`` (default 0.2). Every request is logged to
-``escalation.jsonl`` in the run output directory.
+``RPENT_ESCALATION_MAX_SHARE`` (default 0.2); ``RPENT_ESCALATION_ERRORS``
+(default 2) sets how many consecutive tool errors trigger the senior;
+``RPENT_CLOUD_CORRECTIONS`` names a file (the task's cloud correction memory)
+appended to every senior note, control turns included, and never shown to the
+worker. Every request is logged to ``escalation.jsonl`` in the run output
+directory.
 
 ``RPENT_ESCALATION_SENIOR_MAX_IMAGES`` (optional) keeps only that many of the
 newest images in senior requests. The shared history is bounded by image
@@ -286,15 +290,17 @@ class EscalationModel(WrapperModel):
         checkin: int = 12,
         max_share: float = 0.2,
         max_vetoes: int = 3,
+        plan: bool = True,
+        errors: int = 2,
+        corrections: str = "",
         log_path: Path | None = None,
         senior_max_images: int | None = None,
-        plan_turn: bool = True,
         plan_memory: str | None = None,
         takeover: int = 0,
         max_takeovers: int = 4,
     ) -> None:
         super().__init__(worker)
-        if checkin < 1 or not 0 < max_share <= 1 or max_vetoes < 0:
+        if checkin < 1 or not 0 < max_share <= 1 or max_vetoes < 0 or errors < 1:
             raise ValueError("invalid escalation budget")
         if takeover < 0 or max_takeovers < 0:
             raise ValueError("invalid takeover budget")
@@ -304,6 +310,8 @@ class EscalationModel(WrapperModel):
         self.checkin = checkin
         self.max_share = max_share
         self.max_vetoes = max_vetoes
+        self.errors = errors
+        self.corrections = corrections.strip()
         self.log_path = log_path
         self.senior_max_images = senior_max_images
         self.plan_memory = plan_memory
@@ -316,7 +324,8 @@ class EscalationModel(WrapperModel):
         self.requests = 0
         self.senior_requests = 0
         self.since_senior = 0
-        self.planned = not plan_turn
+        # Without a plan turn, the senior first joins on another event.
+        self.planned = not plan
         self.vetoes = 0
         # Tool results already reviewed by the senior do not trigger again.
         self.reviewed_results = 0
@@ -344,11 +353,22 @@ class EscalationModel(WrapperModel):
             center = [sum(axis) / len(window) for axis in zip(*window)]
             if max(math.dist(p, center) for p in window) < STALL_SPAN_M:
                 return "stall"
-        if len(fresh) >= 2 and all("error" in r for _, r in fresh[-2:]):
+        if len(fresh) >= self.errors and all(
+            "error" in r for _, r in fresh[-self.errors :]
+        ):
             return "errors"
         if self.since_senior >= self.checkin:
             return "checkin"
         return None
+
+    def _corrections_note(self) -> str:
+        if not self.corrections:
+            return ""
+        return (
+            "\nCloud correction memory for this task (your diagnoses and fixes from "
+            "earlier episodes; apply an entry only when its situation matches):\n"
+            + self.corrections
+        )
 
     def _senior_note(self, reason: str, proposal: dict | None = None) -> str:
         if reason == "control":
@@ -358,7 +378,7 @@ class EscalationModel(WrapperModel):
                 f"{turn} of {self.takeover}); the worker is paused. Review the latest "
                 "results and images and make the next tool call yourself. Start your "
                 f"reply with {HAND_BACK} once the worker can safely continue from here."
-            )
+            ) + self._corrections_note()
         why = {
             "plan": "memory and the initial scene have been read; set the overall strategy",
             "stall": "the last robot motions barely moved the end effector",
@@ -373,6 +393,7 @@ class EscalationModel(WrapperModel):
             "sentences for the worker, then make the next tool call yourself. Do not "
             "reply with text only."
         )
+        note += self._corrections_note()
         if proposal is not None:
             summary = str(proposal.get("summary", ""))[:1200]
             note += (
@@ -458,6 +479,8 @@ class EscalationModel(WrapperModel):
             "reason": reason,
             "model": model.model_name,
         }
+        if senior and self.corrections:
+            record["corrections_chars"] = len(self.corrections)
         try:
             response = await model.request(
                 self._labeled(messages),
@@ -600,6 +623,12 @@ class EscalationModel(WrapperModel):
             stream.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
+def _read_corrections(path: str | None) -> str:
+    if not path or not Path(path).is_file():
+        return ""
+    return Path(path).read_text(encoding="utf-8")
+
+
 def escalation_from_env(
     worker: Model, *, output_dir: str | Path, reasoning_effort: str
 ) -> Model:
@@ -643,13 +672,15 @@ def escalation_from_env(
         senior_settings=senior_settings,
         checkin=int(os.environ.get("RPENT_ESCALATION_CHECKIN", "12")),
         max_share=float(os.environ.get("RPENT_ESCALATION_MAX_SHARE", "0.2")),
+        plan=os.environ.get("RPENT_ESCALATION_PLAN", "1") != "0",
+        errors=int(os.environ.get("RPENT_ESCALATION_ERRORS", "2")),
+        corrections=_read_corrections(os.environ.get("RPENT_CLOUD_CORRECTIONS")),
         log_path=Path(output_dir) / "escalation.jsonl",
         senior_max_images=(
             int(os.environ["RPENT_ESCALATION_SENIOR_MAX_IMAGES"])
             if os.environ.get("RPENT_ESCALATION_SENIOR_MAX_IMAGES")
             else None
         ),
-        plan_turn=os.environ.get("RPENT_ESCALATION_PLAN", "1") != "0",
         plan_memory=(
             load_plan_memory(plan_files.split(os.pathsep))
             if (plan_files := os.environ.get("RPENT_ESCALATION_PLAN_FILES"))

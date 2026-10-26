@@ -96,20 +96,47 @@ def _render(metadata: dict[str, Any], body: str) -> str:
     )
 
 
+def _attempt_count(value: Any) -> int:
+    """Attempts as an int; drafts sometimes write a list such as ``[3]``."""
+    if isinstance(value, list):
+        return sum(_attempt_count(item) for item in value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _evidence_items(evidence: dict[str, Any], key: str) -> list[Any]:
+    value = evidence.get(key)
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
 def _merge_evidence(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     old_evidence = old.get("evidence") or {}
     new_evidence = new.get("evidence") or {}
-    cells = sorted({*old_evidence.get("cells", []), *new_evidence.get("cells", [])})
+    cells = sorted(
+        {
+            *_evidence_items(old_evidence, "cells"),
+            *_evidence_items(new_evidence, "cells"),
+        },
+        key=str,
+    )
     evidence = {
         **old_evidence,
         "cells": cells,
-        "attempts": int(old_evidence.get("attempts") or 0)
-        + int(new_evidence.get("attempts") or 0),
+        "attempts": _attempt_count(old_evidence.get("attempts"))
+        + _attempt_count(new_evidence.get("attempts")),
     }
     for key in ("solved_seeds", "failed_seeds", "contradicted_by"):
         if key in old_evidence or key in new_evidence:
             evidence[key] = sorted(
-                {*old_evidence.get(key, []), *new_evidence.get(key, [])}
+                {
+                    *_evidence_items(old_evidence, key),
+                    *_evidence_items(new_evidence, key),
+                },
+                key=str,
             )
     tasks = {str(cell).rsplit("_s", 1)[0] for cell in cells}
     confidence = (
@@ -215,6 +242,12 @@ class MemoryManager:
         Drafts merge into global/task-family; conflicting prose is
         archived under _internal/conflicts. Solved audit/recipe pairs are
         copied to task-specific/. MEMORY.md is refreshed at the end.
+
+        With ``RPENT_MEMORY_MERGE_REPLACE=1``, a solved cell's own
+        task-family write-up and audit/recipe pair replace the ones already
+        published for it (the previous files move to _internal/replaced), so
+        an explorer seeded with another model's corpus ends up with its own
+        task memory. Global notes merge as usual.
         """
         self.check_layout()
         root = self._root
@@ -223,6 +256,8 @@ class MemoryManager:
         inbox = internal / "inbox" / cell_tag
         conflicts = internal / "conflicts"
         merged = internal / "merged"
+        replaced = internal / "replaced"
+        replace = solved and os.environ.get("RPENT_MEMORY_MERGE_REPLACE") == "1"
         tiers = {
             "global": root / "global",
             "task-family": root / "task-family",
@@ -240,6 +275,8 @@ class MemoryManager:
             "conflicts": 0,
             "skipped": [],
         }
+        if replace:
+            result["replaced"] = 0
         lock_path = internal / "merge.lock"
         lock_path.touch(exist_ok=True)
         with lock_path.open("r+") as lock_file:
@@ -272,6 +309,15 @@ class MemoryManager:
                         f"{destination.name} left untouched"
                     )
                     continue
+                if replace and metadata["scope"] == "task-family":
+                    replaced.mkdir(parents=True, exist_ok=True)
+                    shutil.move(
+                        str(destination),
+                        str(replaced / f"{memory_id}__before_{cell_tag}.md"),
+                    )
+                    destination.write_text(_render(metadata, body))
+                    result["replaced"] += 1
+                    continue
                 credited = cell_tag in (
                     (old_metadata.get("evidence") or {}).get("cells") or []
                 )
@@ -296,6 +342,14 @@ class MemoryManager:
             if solved and audit.exists() and recipe.exists():
                 audit_target = tiers["task"] / audit.name
                 recipe_target = tiers["task"] / recipe.name
+                if replace and audit_target.exists() and recipe_target.exists():
+                    archive = replaced / cell_tag
+                    if archive.exists():
+                        shutil.rmtree(archive)
+                    archive.mkdir(parents=True)
+                    shutil.move(str(audit_target), str(archive / audit.name))
+                    shutil.move(str(recipe_target), str(archive / recipe.name))
+                    result["replaced"] += 1
                 if not audit_target.exists() and not recipe_target.exists():
                     shutil.copy2(audit, audit_target)
                     shutil.copy2(recipe, recipe_target)

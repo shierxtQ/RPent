@@ -62,6 +62,7 @@ class LiberoPrimitives:
         molmo_client: MolmoClient | None = None,
         flywheel_config: dict[str, Any] | None = None,
         perception_arbiter: Any | None = None,
+        shared_sim: bool = False,
     ):
         self.env = env
         self.model = model
@@ -81,6 +82,9 @@ class LiberoPrimitives:
         # Optional cross-process scheduler for shared Pi0.5/SAM3 services.
         # It is None by default, preserving the original single-task path.
         self._perception_arbiter = perception_arbiter
+        # With shared_sim, simulator work of all tasks on the host also takes
+        # turns through the same queue (env processes stay resident).
+        self._shared_sim = bool(shared_sim) and perception_arbiter is not None
         self._flywheel = None
 
     def start_recording(self):
@@ -140,8 +144,14 @@ class LiberoPrimitives:
             return nullcontext()
         return self._perception_arbiter.hold("perception")
 
+    def sim_slot(self):
+        """Acquire the optional host-wide simulator slot (FIFO across tasks)."""
+        if not self._shared_sim:
+            return nullcontext()
+        return self._perception_arbiter.hold("libero_sim")
+
     def perception_wait_s(self) -> float:
-        """Return queue wait accumulated by this environment process."""
+        """Return queue wait (perception and simulator) of this process."""
         if self._perception_arbiter is None:
             return 0.0
         return float(self._perception_arbiter.current_wait_s())
