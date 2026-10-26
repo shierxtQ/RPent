@@ -35,7 +35,7 @@ shares the same conversation and takes the next request only when:
 ``RPENT_CLOUD_CORRECTIONS`` names a file (the task's cloud correction memory)
 appended to every senior note, control turns included, and never shown to the
 worker. Every request is logged to ``escalation.jsonl`` in the run output
-directory.
+directory; its first row (``config``) records the routing settings in use.
 
 ``RPENT_ESCALATION_SENIOR_MAX_IMAGES`` (optional) keeps only that many of the
 newest images in senior requests. The shared history is bounded by image
@@ -59,6 +59,7 @@ Optional mechanisms (off by default; each can be switched on alone):
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -329,6 +330,31 @@ class EscalationModel(WrapperModel):
         self.vetoes = 0
         # Tool results already reviewed by the senior do not trigger again.
         self.reviewed_results = 0
+        # The first row states the routing this run uses, so an experiment can
+        # check its switches from the log alone.
+        self._log(
+            {
+                "config": {
+                    "worker": worker.model_name,
+                    "senior": senior.model_name,
+                    "plan": plan,
+                    "checkin": checkin,
+                    "errors": errors,
+                    "max_share": max_share,
+                    "max_vetoes": max_vetoes,
+                    "corrections_chars": len(self.corrections),
+                    "corrections_sha256": (
+                        hashlib.sha256(self.corrections.encode("utf-8")).hexdigest()
+                        if self.corrections
+                        else None
+                    ),
+                    "senior_max_images": senior_max_images,
+                    "plan_memory_chars": len(plan_memory) if plan_memory else 0,
+                    "takeover": takeover,
+                    "max_takeovers": max_takeovers,
+                }
+            }
+        )
 
     # -- routing ---------------------------------------------------------------
 
