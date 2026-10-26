@@ -29,6 +29,15 @@ arguments only in ``response.function_call_arguments.done``, with no deltas.
 Pydantic AI builds streamed tool arguments from deltas alone, so every
 parallel call arrived with empty arguments; :class:`_BackfillToolArgs`
 re-emits such arguments as a single delta.
+
+The gateway also occasionally completes a reply without any output: the
+``response.completed`` event carries a response whose ``output`` is null or
+absent. Pydantic AI 2.53 iterates that field while reading the event
+(``OpenAIResponsesStreamedResponse._get_event_iterator``) and fails with
+``TypeError: 'NoneType' object is not iterable``. :class:`_BackfillToolArgs`
+raises such an event as ``UnexpectedModelBehavior`` instead, which
+:class:`~rpent.planner.retry.RetryingModel` requests again. An empty ``output``
+list is a valid reply and passes through.
 """
 
 from __future__ import annotations
@@ -40,17 +49,22 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from openai.types import responses
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 
+from rpent.planner.retry import EMPTY_RESPONSE_PREFIX
+
 
 class _BackfillToolArgs:
     """Turn delta-less ``function_call_arguments.done`` events into one delta.
 
-    Wraps the SDK event stream of an ``OpenAIResponsesStreamedResponse`` and
-    keeps its ``source`` so ``close_stream`` still reaches the connection.
+    Also rejects a ``response.completed`` event without ``output`` as a
+    retryable error. Wraps the SDK event stream of an
+    ``OpenAIResponsesStreamedResponse`` and keeps its ``source`` so
+    ``close_stream`` still reaches the connection.
     """
 
     def __init__(self, stream: Any) -> None:
@@ -67,6 +81,13 @@ class _BackfillToolArgs:
         if self._pending:
             return self._pending.pop()
         chunk = await anext(self._iterator)
+        if (
+            isinstance(chunk, responses.ResponseCompletedEvent)
+            and chunk.response.output is None
+        ):
+            raise UnexpectedModelBehavior(
+                f"{EMPTY_RESPONSE_PREFIX}: response.completed carried no output"
+            )
         if isinstance(chunk, responses.ResponseOutputItemAddedEvent):
             item = chunk.item
             if isinstance(item, responses.ResponseFunctionToolCall) and item.arguments:

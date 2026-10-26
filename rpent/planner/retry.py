@@ -42,6 +42,15 @@ for a tool with required parameters is requested again, up to N times.
 Infini occasionally answers with ``finish_reason: ""``, which fails the Chat
 Completions schema and surfaces as ``UnexpectedModelBehavior: Invalid response
 from openai chat completions endpoint``; it is retried like a 5xx.
+
+A Responses gateway occasionally ends a streamed reply with a
+``response.completed`` event whose response has no ``output``. Pydantic AI
+then fails with ``TypeError: 'NoneType' object is not iterable`` while reading
+it, which ended the episode. :mod:`rpent.planner.prompt_cache`, which streams
+every Responses request, raises such a completion as
+``UnexpectedModelBehavior`` starting with :data:`EMPTY_RESPONSE_PREFIX`, and it
+is retried like a 5xx. A completion with an empty ``output`` list and refused
+prompts (``invalid_prompt``) are returned or raised as before.
 """
 
 from __future__ import annotations
@@ -105,6 +114,9 @@ def _empty_required_tool_call(
 
 #: A malformed provider response (schema validation failed), not a model bug.
 INVALID_RESPONSE_PREFIX = "Invalid response from openai chat completions endpoint"
+#: A streamed Responses reply that completed without ``output`` (raised by
+#: :mod:`rpent.planner.prompt_cache`), not a model bug.
+EMPTY_RESPONSE_PREFIX = "Empty response from openai responses endpoint"
 
 
 class RetryingModel(WrapperModel):
@@ -202,7 +214,7 @@ class RetryingModel(WrapperModel):
                 attempt += 1
             except UnexpectedModelBehavior as exc:
                 if attempt >= self.retries or not exc.message.startswith(
-                    INVALID_RESPONSE_PREFIX
+                    (INVALID_RESPONSE_PREFIX, EMPTY_RESPONSE_PREFIX)
                 ):
                     raise
                 await self._backoff(exc, attempt)
