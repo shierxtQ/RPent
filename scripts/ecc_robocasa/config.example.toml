@@ -1,0 +1,112 @@
+# RC-ECC RoboCasa runner config (example). Copy it OUTSIDE the repository, fill in the
+# placeholders, and pass it with --config or ECC_RC_CONFIG. Machine values never go into git.
+
+[paths]
+code_dir = "/path/to/ecc-code"                # synced copy of this branch: PYTHONPATH and RPENT_REPO_ROOT
+venv = "/path/to/RPent/.venv"                 # venv with RPent's RoboCasa dependencies (used read-only)
+cloud_corpus = "/path/to/memory/GPT_6_astra_high"   # cloud (GPT-6) memory corpus; copied, never modified
+runs_dir = "/path/to/robocasa/ecc"            # run roots are created here (--run-id)
+assets = "/path/to/robocasa/assets"           # ROBOCASA_ASSETS_PATH
+hf_home = "/path/to/robocasa/hf-home"         # HF_HOME (HF_HUB_CACHE = hf_home/hub)
+rldx_checkpoint = "/path/to/robocasa/checkpoints/rldx-1-ft-rc365"
+llvmpipe_index_script = "/path/to/llvmpipe_index.sh"   # prints Mesa llvmpipe's EGL device index
+gpu_status_csv = ""                           # optional platform GPU status CSV checked next to nvidia-smi
+# mesa_egl_vendor_json = "/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+# cuda_lib = "/usr/local/cuda/lib64"
+# torch_lib = ""                              # default: <venv>/lib/python3*/site-packages/torch/lib
+
+[credentials]
+file = "/path/to/credentials.env"             # sourced by the cell launcher with set -a; never read by the runner
+worker_key_var = "WORKER_API_KEY"             # variable in that file that becomes OPENAI_API_KEY
+senior_base_url_var = "SENIOR_BASE_URL"       # exported as the Target50 launcher does (unused with Qwen alone)
+senior_key_var = "SENIOR_API_KEY"
+
+[worker]
+model = "openai-chat:qwen3.6-27b"
+base_url = "https://worker-provider.example/v1"
+reasoning_effort = "none"
+
+[senior]                                      # unused in stage 1 (RPENT_ESCALATION=0)
+model = "openai:gpt-6-astra"
+reasoning_effort = "low"
+checkin = 5
+max_share = 0.2
+
+[episode]
+max_turns = 100                               # per exploration session
+lp_threads = 8                                # llvmpipe threads per env server
+torch_cuda_arch_list = "9.0"
+
+[episode.env]                                 # added to every episode's and server's environment
+HF_HUB_OFFLINE = "1"
+OMP_NUM_THREADS = "1"
+OPENBLAS_NUM_THREADS = "1"
+MKL_NUM_THREADS = "1"
+
+[stage1]
+seed = 0
+sessions = 5                                  # the stage budget: at most 5 sessions x 3 attempts
+attempts_per_session = 3
+session_timeout_s = 2400                      # planner (active) time per session
+# session_timeout_s_by_split = { composite_seen = 2400, composite_unseen = 2400 }
+tasks = []                                    # empty: all 50 Target50 tasks in manifest order
+infra_retries = 2                             # relaunches of a task after an invalid result
+render_retries = 6                            # relaunches after rendered noise
+publish_impl = "auto"                         # robots.robocasa.memory:publish_exploration_cell
+list_memory = true                            # the explore prompt lists the task's staged cloud files
+
+[gpus]
+allowed = [4, 5, 6, 7]                        # a server is only ever started on these
+max_used_mb = 2048                            # "free" = below this and at most max_util_pct
+max_util_pct = 5
+plan_max_mb = 72000                           # per GPU: servers x servers.server_mb + slots x servers.cell_mb
+
+[servers]
+max_gpus = 2                                  # claim at most this many free GPUs (0: all free allowed GPUs)
+retry_busy_s = 300                            # a busy GPU's endpoints are checked again this often
+max_refusals = 30
+[servers.env]                                 # RLDX servers' CPU thread pools (the default pools waste cores)
+OMP_NUM_THREADS = "4"
+MKL_NUM_THREADS = "4"
+OPENBLAS_NUM_THREADS = "4"
+
+# One [[endpoints]] entry per shared RLDX server. Several servers may share a GPU (each its own
+# port; pick ports outside the ephemeral range, which the env servers' free ports come from); a GPU
+# is claimed only when it is free. Two GPUs x 3 servers x 8-9 slots run all 50 tasks at once.
+[[endpoints]]
+gpu = 4
+port = 29761
+slots = 9
+
+[[endpoints]]
+gpu = 4
+port = 29762
+slots = 8
+
+[[endpoints]]
+gpu = 4
+port = 29763
+slots = 8
+
+[[endpoints]]
+gpu = 5
+port = 29764
+slots = 9
+
+[[endpoints]]
+gpu = 5
+port = 29765
+slots = 8
+
+[[endpoints]]
+gpu = 5
+port = 29766
+slots = 8
+
+[scheduler]
+max_slots = 50                                # hard ceiling of concurrent cells (live override: <run>/concurrency)
+launch_stagger_s = 5
+poll_s = 10
+infra_breaker = 5                             # consecutive invalid tries that stop new launches
+max_total_launches = 0                        # 0: tasks + tasks x infra_retries + tasks
+cost_ceiling_usd = 0                          # 0: off; else stop launching above this list-price total
