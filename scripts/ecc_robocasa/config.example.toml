@@ -110,3 +110,54 @@ poll_s = 10
 infra_breaker = 5                             # consecutive invalid tries that stop new launches
 max_total_launches = 0                        # 0: tasks + tasks x infra_retries + tasks
 cost_ceiling_usd = 0                          # 0: off; else stop launching above this list-price total
+
+[stage2]                                      # stage 2: the call-rule ladder (stage2.py)
+seed = 11                                     # must differ from stage1.seed
+s1_product = "/path/to/robocasa/ecc/s1_full/product"   # frozen stage-1 product, verified before launching
+tasks = []                                    # empty: all 50 Target50 tasks
+ladder = []                                   # empty: the ECC rule's 6 rungs; else [{plan = "gpt"|"qwen", checkin = K, errors = N}, ...]
+fallback_rung = 0                             # 0: the last rung when every rung fails validly
+infra_retries = 2                             # per rung; never counted as a rung failure
+render_retries = 6
+require_config_row = true                     # escalation.jsonl must state plan/K/N (RPent's config row)
+# launcher = ["bash", "{code_dir}/scripts/ecc_robocasa/hybrid_cell.sh"]
+
+[stage2.timeout_s_by_split]                   # planner time per episode (the Target50 protocol)
+atomic = 1800
+composite_seen = 3600
+composite_unseen = 3600
+
+[stage3]                                      # stage 3: the cloud correction memory (stage3.py)
+seed = 12                                     # refused if a Target50 cell (0-10) or stage 2's seed
+s1_product = "/path/to/robocasa/ecc/s1_full/product"   # frozen stage-1 product (stage1.verify)
+s2_product = "/path/to/robocasa/ecc/s2_full/product"   # frozen stage-2 product (stage2.verify), searched on that corpus
+tasks = []                                    # empty: all 50 Target50 tasks
+sessions = 5                                  # 5 x 3 = 15 single-shot episodes per task; the first valid success stops
+attempts_per_session = 3
+infra_retries = 2                             # per episode; never counted, never reflected on
+render_retries = 6
+cost_ceiling_usd = 0                          # episodes + reflections (0: scheduler.cost_ceiling_usd)
+max_entries = 8                               # the correction-memory bookkeeping of scripts/ecc/run_ecc_stage3.py
+field_chars = 500
+fails_to_drop = 2
+context_before = 3
+context_after = 6
+# launcher = ["bash", "{code_dir}/scripts/ecc_robocasa/hybrid_cell.sh"]
+
+[stage3.timeout_s_by_split]                   # planner time per episode (default: the Target50 protocol)
+atomic = 1800
+composite_seen = 3600
+composite_unseen = 3600
+
+[stage3.reflection]                           # one offline GPT-6 call after every valid episode with a senior turn
+model = ""                                    # "": senior.model, through the senior's model chain
+reasoning_effort = ""                         # "": senior.reasoning_effort
+max_output_tokens = 8192
+timeout_s = 900                               # one call, its retries included
+empty_retries = 3                             # a reply without text is requested again
+max_calls = 3                                 # failed calls of one episode before STOP (a content-filter refusal is a skip)
+retry_delay_s = 120
+max_parallel = 16
+# cmd = ["bash", "{code_dir}/scripts/ecc_robocasa/reflect_call.sh"]
+
+# The final test: `final_test.py example-config` prints a [final_test] section with its arms.

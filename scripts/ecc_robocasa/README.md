@@ -221,3 +221,140 @@ set, one more test compares the cell launcher's effective environment with that 
 cd /path/to/ecc-code && PYTHONPATH=$PWD RPENT_REPO_ROOT=$PWD CUDA_VISIBLE_DEVICES= \
   /path/to/RPent/.venv/bin/python -m pytest -q tests/unit_tests/ecc_robocasa
 ```
+
+# Stage 2: the call-rule ladder (`stage2.py`)
+
+Stage 2 searches, per task, the cheapest rule for when Qwen calls GPT-6. Every task climbs the
+ECC rule's ladder on seed 11, one hybrid evaluation episode per rung, from the rule with the least
+cloud help to the most; the first rung with a valid success becomes the task's rule, and a task
+whose rungs all fail validly gets the strongest rung. Files: `stage2.py` (CLI), `hybrid_episode.py`
+(rules, the cell environment, the escalation evidence check and the episode record; shared with
+stage 3 and the final test), `hybrid_cell.sh` (one hybrid episode).
+
+| Item | Value (config key) |
+|---|---|
+| Planner | Qwen worker plus GPT-6 senior at low effort with the 0.2 share cap: the Target50 launcher's base arm (same `RPENT_*`, `RLDX_*`, CPU rendering, credentials sourced from a file) |
+| Ladder | `stage2.ladder` (empty: the ECC rule's six rungs (plan, K, N) = (Qwen,12,4), (GPT-6,12,4), (Qwen,6,4), (GPT-6,6,4), (GPT-6,6,3), (GPT-6,6,2), named `c1_qwenplan_K12_N4` ... `c6_gptplan_K6_N2` as in `scripts/ecc/run_ecc_stage2.py`). "GPT-6 plan" is the plain plan turn; Qwen plan is `RPENT_ESCALATION_PLAN=0`; K is `RPENT_ESCALATION_CHECKIN`; N is `RPENT_ESCALATION_ERRORS` |
+| Seed / split | `stage2.seed` = 11 (refused if equal to stage 1's seed), environment split `target`; every rung of a task plays the same seed-11 scene |
+| Memory | the frozen stage-1 corpus `stage2.s1_product`/corpus, `--memory-profile local`, read-only: evaluation's RoboCasa memory manager refuses writes, the frozen files are 0444, `hybrid_cell.sh` refuses a writable corpus, and the corpus hash is checked after every launch |
+| Budget | one valid episode per rung, planner timeout `stage2.timeout_s_by_split` (Target50: 1800 s atomic, 3600 s composite; a timeout is a valid failure), `episode.max_turns` = 100 |
+| Invalid episodes | relaunched, at most `stage2.infra_retries` (infrastructure) and `stage2.render_retries` (rendered noise) times per rung; never a rung failure. A rung that exhausts them blocks its task: `unblock --task T` gives that rung a fresh budget, or `freeze --fallback-blocked` gives blocked tasks the fallback rung (recorded as `fallback_infra_blocked`) |
+| Fallback | `stage2.fallback_rung` (0: the last rung) when every rung failed validly |
+
+**Escalation evidence.** RPent's escalation wrapper writes a `config` row first in
+`escalation.jsonl` (plan, K, N, share cap, corrections length and sha256, models). For every launch
+the runner checks that row against the rung (as soon as it appears, so a wrongly launched cell is
+stopped at once) and, when the launch ends, replays the wrapper's routing from the logged requests:
+a plan turn by request 6 exactly when the plan turn is on, a check-in only after at least K worker
+requests and never missing when one was due below the share cap, no takeover, the expected
+`corrections_chars` on every senior row, and the worker and senior model names. A mismatch makes
+the launch an infrastructure error and writes `STOP` (running cells drain and are checked too).
+`stage2.require_config_row` (default true) refuses code without the config row, since it is the
+only record of N. Each episode records how often the errors trigger fired.
+
+**Scheduling.** One job per (task, rung) on `common.Scheduler`: all tasks run in parallel, a task's
+rungs one after another (rung k+1 only after rung k failed validly; with fewer slots than tasks,
+every task's rung k goes before any rung k+1), infrastructure retries first, render retries last.
+Slots, the live `concurrency` file, the launch ceiling (tasks x rungs + tasks x infra retries +
+tasks, or `scheduler.max_total_launches`), the infrastructure breaker, the cost ceiling, `STOP`,
+resume and adoption of live cells work as in stage 1.
+
+```bash
+PY=/path/to/RPent/.venv/bin/python; S=/path/to/ecc-code/scripts/ecc_robocasa/stage2.py
+export ECC_RC_CONFIG=/path/to/config_s23.toml PYTHONDONTWRITEBYTECODE=1
+$PY /path/to/ecc-code/scripts/ecc_robocasa/stage1.py verify /path/to/runs/s1_full/product   # must print "ok": true
+$PY $S plan --run-id s2_full                    # dry run: S1 product verified, ladder, first launch; starts nothing
+setsid -f nohup $PY $S run --run-id s2_full --go --concurrency 2 > /path/to/s2_full.out 2>&1 < /dev/null
+$PY $S status --run-id s2_full --tasks-table    # progress bar, per split: decided/running/queued/blocked, rungs, $
+echo 50 > /path/to/runs/s2_full/concurrency     # full speed once the first episodes look right
+$PY $S stop --run-id s2_full [--now]            # drain (or stop the running cells: relaunched, not counted)
+$PY $S verify /path/to/runs/s2_full/product     # recompute the frozen rules' hashes
+$PY $S rules /path/to/runs/s2_full/product      # one line per task, and the summary
+```
+
+```
+<runs_dir>/<run-id>/
+  manifest.json          stage s2: code, config and experiment hashes, the S1 product's corpus and PRODUCT.json hashes,
+                         seed, ladder, budget, tasks
+  state/jobs/<Task>__r<k>.json   every launch of one rung (class, outcome, usage, evidence); skipped/blocked marks
+  tasks/<Task>/
+    r<k>/try<n>/         RPent's --output-dir (run.log, result.json, escalation.jsonl, transcript, states)
+    r<k>/try<n>.console.log, r<k>/try<n>.infra (a runner-forced infrastructure cause, e.g. an evidence mismatch)
+    r<k>/episode.json    the rung's record: valid/success/termination, turns, GPT-6 calls by reason, errors trigger
+                         count, vetoes, Qwen and GPT-6 tokens and list-price $, wall time, evidence, file-tool audit
+    rule.json            the task's rule once decided; blocked.json when a rung has no valid result
+  product/               the frozen stage-2 product (read-only)
+    rules/<Task>.json    schema rc-ecc-s2-rule/1: run_ecc_stage2.py's RULES_DIR fields (task, suite, task_id, search_seed,
+                         rule {gpt_plan, checkin_K, errors_N}, config, solved_in_search, episodes,
+                         gpt_calls_in_search, history[{config, success, gpt_calls, turns, finish_status, last_error}],
+                         written_at) plus split, rung, rule_source, launches, GPT-6 calls by reason, errors trigger
+                         counts, tokens, $, per-rung details and the S1 corpus hash
+    RULES.json           schema rc-ecc-s2-product/1: hashes of every rule file, the rules tree hash, code, config,
+                         S1 product, per-task summary, chosen-config counts per split
+    episodes.json        every rung's record, for the paper
+    FROZEN               the rules tree hash; written last
+```
+
+**What stage 3 and the test read.** `product/rules/<Task>.json` (field `rule`) after
+`stage2.py verify <run>/product`; in Python, `stage2.load_rules(<run>/product)` verifies and
+returns `{task: Rule}`. `gpt_calls` counts GPT-6 calls that returned (`scripts/ecc/run_ecc_stage2.py` also
+counted senior rows that ended in an error; those are `gpt_errors` in `episode.json`).
+
+# Stage 3: the cloud correction memory (`stage3.py`)
+
+Stage 3 builds, per task, the correction memory GPT-6 keeps for that task. Every task runs hybrid
+episodes on seed 12 under its frozen stage-2 rule, with the frozen stage-1 corpus read-only: up to
+`stage3.sessions` x `stage3.attempts_per_session` = 5 x 3 = 15 independent single-shot episodes
+(labels `s1_a1` .. `s5_a3`, as in `scripts/ecc/run_ecc_stage3.py`), stopping at the first valid
+success. Files: `stage3.py` (CLI), `reflect.py` (digest, prompt, reply parsing and entry
+bookkeeping, ported from `scripts/ecc/run_ecc_stage3.py`), `reflect_call.sh` and
+`reflect_client.py` (one GPT-6 reflection call).
+
+| Item | Value (config key) |
+|---|---|
+| Episodes | `hybrid_cell.sh` with the task's rule (`stage3.s2_product`/rules/`<Task>.json`, verified with `stage2.verify` and searched on the same stage-1 corpus), planner timeout `stage3.timeout_s_by_split` (default Target50) |
+| Correction memory | before each episode the task's memory is frozen as `corrections_used.md` (0444) and passed as `RPENT_CLOUD_CORRECTIONS` (appended to every senior note, never shown to Qwen); its existence, sha256 and size are checked and logged before every launch, the cell launcher checks the sha256 again, and the escalation log's config row and every senior row must show its length |
+| Reflection | after every valid episode, one offline GPT-6 call at the senior's model and effort (`stage3.reflection`); skipped when the episode has no senior turn, or no planner turn in the transcript or `run.log`; a content-filter refusal is recorded as skipped; other failures are retried (`max_calls`), then the run stops |
+| Bookkeeping | as `run_ecc_stage3.apply`: an entry counts as used only when listed in `applied`; success verifies; `fails_to_drop` failures without a success drop an entry; a revision resets its failures; at most `max_entries` entries of `field_chars` per field |
+| RoboCasa changes | tool results show their outcome first (skill, `ok`/`status`/`error`, `task_progress`, ...) before anything is clipped; an episode cut by the planner timeout is rebuilt from `run.log` with robot results from `states.json`; the prompt describes RoboCasa and names the termination reason |
+| Invalid episodes | relaunched under `stage3.infra_retries` / `stage3.render_retries`, never reflected on and never counted; a task whose episode exhausts them stops (`requeue --task T` reruns it) |
+| Cost guard | `stage3.cost_ceiling_usd` over episodes and reflections (else `scheduler.cost_ceiling_usd`) |
+
+```bash
+S=/path/to/ecc-code/scripts/ecc_robocasa/stage3.py
+$PY /path/to/ecc-code/scripts/ecc_robocasa/stage2.py verify /path/to/runs/s2_full/product   # "ok": true
+$PY $S plan --run-id s3_full                     # dry run: inputs verified, rules per task, first launch
+setsid -f nohup $PY $S run --run-id s3_full --go --concurrency 2 > /path/to/s3_full.out 2>&1 < /dev/null
+$PY $S status --run-id s3_full --tasks-table     # progress bar, per split, reflections, entries, $
+$PY $S verify /path/to/runs/s3_full/product      # recompute the frozen memories' hashes
+$PY $S reflect-only EPISODE_DIR                  # the digest and prompt of one finished episode (no call)
+```
+
+The product is `product/final/<Task>.md` (verified entries only, rendered as `run_ecc_stage3.render`;
+empty when there are none) and `<Task>.json`, with `PRODUCT.json` (schema `rc-ecc-s3-product/1`).
+
+# The final test (`final_test.py`)
+
+`final_test.py` runs named arms (`[final_test.arms.<name>]`: planner hybrid or qwen, memory s1 /
+cloud / a path, rule s2 or fixed plan/K/N, corrections none or s3) over task x seed x repeat cells,
+with the arms of a cell launched next to each other in a seeded order. Every input product is
+verified with its stage's `verify`, checked to be built on the others, and copied read-only into
+the run. Episodes start through `hybrid_cell.sh` (`ECC_RC_ESCALATION=0` turns the senior off for
+Qwen-alone arms, as the Target50 launcher's `ABL_ESCALATION=0`) and get stage 2's evidence check.
+`score` reports task-weighted success per split, GPT-6 calls by reason, how often the errors
+trigger fired, cost per episode and per success, and paired tests (McNemar on cells, a sign test
+over tasks, a task-clustered sign-flip test, a bootstrap interval). `final_test.py example-config`
+prints a `[final_test]` section.
+
+# Chaining the stages (`chain.py`)
+
+`chain.py wait-product --stage s1|s2|s3 --run-root RUN` returns once `RUN/product` is frozen and
+verifies, and gives up when the run's runner ended without one; `chain.py wait-idle --run-root RUN`
+waits until the run's runner and RLDX servers are gone (stages 2 and 3 share ports). `chain.py gate --run-root RUN
+--since ISO` follows a stage-2/3 run started at `ISO` at low concurrency: it passes when the first
+two jobs to finish are final with a valid result and a matching escalation log (stage 3: and their
+reflections are written), and one GPT-6 call (stage 3: and one reflection reply) returned; it fails
+on a STOP file, an infrastructure or stopped launch, an evidence mismatch, a GPT-6 call that ended
+in an error, a failed reflection, or a runner that exits. If the smoke episodes needed no
+GPT-6 call it waits for one (`--senior-wait-s`), then passes with a warning or fails
+(`--on-no-senior`). It never changes the run; the caller raises `RUN/concurrency`.
