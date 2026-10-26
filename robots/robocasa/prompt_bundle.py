@@ -28,7 +28,7 @@ def system_prompt(
 ) -> dict[str, PromptNode]:
     """Return the RoboCasa system prompt tree."""
     if (variables or {}).get("mode", "eval") == "explore":
-        return explore_parts.system_prompt()
+        return explore_parts.system_prompt(variables)
     return evaluate_parts.system_prompt(variables)
 
 

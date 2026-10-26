@@ -8,8 +8,18 @@ structured tools and layered-memory contract.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
+
+from robots.robocasa.memory import memory_from_variables
 from robots.robocasa.prompts import evaluate as base
 from rpent.prompt.utils import BulletList, PromptNode
+
+#: ``RPENT_EXPLORE_LIST_MEMORY=1`` lists the corpus files of the current task and
+#: split in the Memory section, as evaluation does, so an explorer seeded with a
+#: published corpus (another model's memory) starts from it instead of having to
+#: find it. Off by default.
+LIST_MEMORY_ENV = "RPENT_EXPLORE_LIST_MEMORY"
 
 ROLE = """
 You are an LLM-in-the-loop robotic explorer for RoboCasa365. This is
@@ -118,12 +128,26 @@ experiment and preserve useful evidence for the next session.
 """
 
 
-def system_prompt() -> dict[str, PromptNode]:
+def _memory(variables: Mapping[str, object] | None) -> str:
+    if variables is None or os.environ.get(LIST_MEMORY_ENV) != "1":
+        return MEMORY
+    selection = memory_from_variables(variables)
+    files = "\n".join(f"- {selection.root / name}" for name in selection.selected)
+    return (
+        MEMORY
+        + "\nPublished memory for this task and split (read-only; read the task "
+        + f"files before acting):\n{files}\n"
+    )
+
+
+def system_prompt(
+    variables: Mapping[str, object] | None = None,
+) -> dict[str, PromptNode]:
     return {
         "Role": ROLE,
         "Goal and memory contract": GOAL,
         "Rules": RULES,
-        "Memory": MEMORY,
+        "Memory": _memory(variables),
         "Localization": base.LOCALIZATION,
         "Navigation": base.NAVIGATION,
         "Primitives": base.PRIMITIVES,

@@ -608,3 +608,7 @@ task-family 笔记。其他 cell（包括已解决但缺少 audit 的 cell）保
 其 task-family 草稿移到 ``_internal/held/<cell>/``。global 草稿照常合并。在其他
 目录中探索的 cell 用 ``robots.robocasa.memory.publish_exploration_cell`` 发布；
 它持有 corpus 的 merge 锁，多个进程可以同时发布。
+
+探索提示词不会列出该任务在 corpus 中的文件。设置 ``RPENT_EXPLORE_LIST_MEMORY=1``
+后，提示词会像评测一样列出它们：该任务的 audit/recipe 文件对、任务笔记和
+task-family 笔记，以及 ``global/*.md``。从已发布的 corpus 开始探索时使用。

@@ -680,3 +680,8 @@ published files in place, and its task-family drafts move to
 against another directory is published with
 ``robots.robocasa.memory.publish_exploration_cell``, which holds the corpus
 merge lock, so several publishers can run at once.
+
+The exploration prompt does not name the corpus files of the task. With
+``RPENT_EXPLORE_LIST_MEMORY=1`` it lists them, as evaluation does: the task's
+audit/recipe pair, its task note and task-family notes, and ``global/*.md``.
+Use it when exploration starts from a published corpus.
