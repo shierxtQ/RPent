@@ -72,6 +72,9 @@ _ARGS_LOG_LIMIT = 250
 _TOOL_LOG_LIMIT = 350
 #: Cap on cumulative decoded image bytes kept in the resent request history.
 #: ``RPENT_MAX_HISTORY_IMAGE_MIB`` overrides it; ``0`` keeps every image.
+#: ``RPENT_MAX_HISTORY_IMAGES`` (optional, unset by default) also caps how many
+#: images the history keeps, newest first: some gateways reject a request above
+#: a number of images however small they are.
 _MAX_HISTORY_IMAGE_BYTES = 4 * 1024 * 1024
 
 #: Always retain at least this many of the most recent images, even if a single
@@ -123,6 +126,11 @@ class ApiAgentLoop:
         if reasoning_effort not in REASONING_EFFORTS:
             raise ValueError(f"unsupported reasoning effort: {reasoning_effort}")
         self._reasoning_effort = reasoning_effort
+        if (limit := _history_image_limit()) is not None:
+            logger.info(
+                "history images: at most %d per request (RPENT_MAX_HISTORY_IMAGES)",
+                limit,
+            )
 
     def solve(
         self,
@@ -691,9 +699,14 @@ class _ApiDashboardSession:
 def _build_model_settings(
     model: Model, max_tokens: int, reasoning_effort: str | None = None
 ) -> ModelSettings:
-    """Build model settings, enabling prompt caching for Anthropic models."""
+    """Build model settings, enabling prompt caching for Anthropic models.
+
+    ``RPENT_SEND_REASONING_IDS=0`` (optional) stops OpenAI Responses requests
+    from sending back the ids of earlier reasoning, text and function-call
+    items, as the escalation senior's requests do.
+    """
     from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
-    from pydantic_ai.models.openai import OpenAIChatModel
+    from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 
     from rpent.planner.retry import unwrap_retry
 
@@ -714,6 +727,13 @@ def _build_model_settings(
         and "qwen" in model.model_name.lower()
     ):
         settings["extra_body"] = {"enable_thinking": False}
+    if os.environ.get("RPENT_SEND_REASONING_IDS") == "0" and isinstance(
+        model, OpenAIResponsesModel
+    ):
+        settings["openai_send_reasoning_ids"] = False
+        logger.info(
+            "earlier response item ids are not sent back (RPENT_SEND_REASONING_IDS=0)"
+        )
     return settings
 
 
@@ -724,6 +744,15 @@ def _history_image_budget() -> int | None:
         return _MAX_HISTORY_IMAGE_BYTES
     mib = float(raw)
     return None if mib <= 0 else int(mib * 1024 * 1024)
+
+
+def _history_image_limit() -> int | None:
+    """History image count cap (``RPENT_MAX_HISTORY_IMAGES``); ``None`` sets no cap."""
+    raw = os.environ.get("RPENT_MAX_HISTORY_IMAGES")
+    if raw is None or not raw.strip():
+        return None
+    count = int(raw)
+    return None if count <= 0 else count
 
 
 def _prune_history_images(messages: list[ModelMessage]) -> list[ModelMessage]:
@@ -743,14 +772,18 @@ def _prune_history_images(messages: list[ModelMessage]) -> list[ModelMessage]:
                     located.append((mi, pi, ii, len(item.data)))
 
     budget = _history_image_budget()
-    if not located or budget is None:
+    limit = _history_image_limit()
+    if not located or (budget is None and limit is None):
         return messages
 
-    # Walk newest -> oldest, keeping images while under the byte budget.
+    # Walk newest -> oldest, keeping images while under the byte budget; the
+    # count cap, when set, is a hard limit (also below _MIN_RECENT_IMAGES).
     keep: set[tuple[int, int, int]] = set()
     total = 0
     for rank, (mi, pi, ii, nbytes) in enumerate(reversed(located)):
-        if rank < _MIN_RECENT_IMAGES or total + nbytes <= budget:
+        if limit is not None and len(keep) >= limit:
+            break
+        if budget is None or rank < _MIN_RECENT_IMAGES or total + nbytes <= budget:
             keep.add((mi, pi, ii))
             total += nbytes
 
