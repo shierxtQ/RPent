@@ -458,11 +458,20 @@ def transcript_summary(try_dir: Path) -> dict[str, Any]:
 
 
 def episode_record(
-    try_dir: Path, pricing: Mapping[str, float], check: Mapping[str, Any]
+    try_dir: Path,
+    pricing: Mapping[str, float],
+    check: Mapping[str, Any],
+    *,
+    usage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Outcome, GPT-6 use and cost of one finished launch."""
+    """Outcome, GPT-6 use and cost of one finished launch.
+
+    ``usage`` replaces ``common.episode_usage`` (the final test's GPT-6-alone arms,
+    which write no escalation log, pass their usage priced as the senior's).
+    """
     outcome = C.read_outcome(try_dir)
-    usage = C.episode_usage(try_dir, pricing) if try_dir.exists() else {}
+    if usage is None:
+        usage = C.episode_usage(try_dir, pricing) if try_dir.exists() else {}
     counts = check.get("counts") or {}
     return {
         "valid": bool(outcome.get("valid")),

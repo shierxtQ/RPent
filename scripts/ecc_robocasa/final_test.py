@@ -17,7 +17,12 @@
 
 Each arm of ``[final_test.arms.<name>]`` is one planner configuration:
 
-- ``planner``: ``hybrid`` (Qwen worker, GPT-6 senior) or ``qwen`` (Qwen alone);
+- ``planner``: ``hybrid`` (Qwen worker, GPT-6 senior), ``qwen`` (Qwen alone) or
+  ``gpt6`` (the senior's model alone on every turn: ``senior.model`` at
+  ``senior.reasoning_effort``, through the senior's base URL and key, with no
+  escalation wrapper; ``max_images``, default 40, caps the images of every
+  request, and ``reasoning_ids``, default false, sends no ids of earlier
+  response items, as the senior's requests);
 - ``memory``: ``s1`` (the frozen stage-1 corpus), ``cloud`` (``paths.cloud_corpus``)
   or an absolute corpus path;
 - ``rule`` (hybrid only): ``s2`` (each task's stage-2 rule) or ``fixed`` with
@@ -31,12 +36,27 @@ provider and RLDX conditions. All inputs (memory corpora, rules, corrections) ar
 copied read-only into the run root and hashed when the run is created, and the
 episodes use the copies. Episodes start through ``hybrid_cell.sh`` with the
 environment of :func:`hybrid_episode.hybrid_env` (``ECC_RC_ESCALATION=0`` for a
-Qwen-alone arm). After every valid episode the escalation log is checked with
+Qwen-alone arm, also ``ECC_RC_SENIOR_ALONE=1`` for a GPT-6-alone arm). After
+every valid episode the escalation log is checked with
 :func:`hybrid_episode.check_escalation`, as in stages 2 and 3 (config row: plan,
 K, N, corrections; replayed plan turn, check-ins and share cap;
-``corrections_chars`` on every senior row); a Qwen-alone arm must leave no
-escalation log. A mismatch makes that launch an infrastructure error and stops
-new launches (``final_test.evidence_policy = "stop"``).
+``corrections_chars`` on every senior row); a Qwen-alone or GPT-6-alone arm must
+leave no escalation log, and a GPT-6-alone episode's ``result.json`` and
+``run.log`` must show its model, effort, image cap and reasoning-id setting. A
+mismatch makes that launch an infrastructure error and stops new launches
+(``final_test.evidence_policy = "stop"``). A GPT-6-alone episode's calls and
+tokens come from RPent's transcript stats (``run.log`` usage lines after a
+planner timeout) and are priced at the senior's list price, so its GPT-6 calls
+per episode count every returned request, as the hybrid arms count the
+senior's returned requests.
+
+``final_test.share_own_gpus`` (off by default) lets the runner start a server on
+a GPU that holds only this machine's ECC processes (another run's RLDX servers
+and episodes, started from ``paths.venv``) when its free memory covers this run's
+servers and slots on it plus ``servers.fit_margin_mb``; GPUs held by anything
+else are refused as before. A refused server is tried again every
+``servers.retry_busy_s`` (at most ``servers.max_refusals`` times), and the runner
+waits for it instead of exiting when no server could start.
 
 ``score`` reports per arm the task-weighted success by split (Target50: a split's
 rate is the mean of its tasks' rates, overall is the mean over all tasks), GPT-6
@@ -64,7 +84,9 @@ import re
 import shutil
 import stat
 import statistics
+import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -81,6 +103,15 @@ STAGE = "final_test"
 SPLIT = S1.SPLIT  # RoboCasa environment split of every Target50 cell
 #: The launcher switch a Qwen-alone arm needs (the Target50 launcher's ABL_ESCALATION=0).
 QWEN_SWITCH = "ECC_RC_ESCALATION"
+#: The launcher switch a GPT-6-alone arm needs (with QWEN_SWITCH=0).
+ALONE_SWITCH = "ECC_RC_SENIOR_ALONE"
+#: Images per request of a GPT-6-alone arm: the senior's cap (the gateway rejects 64-80).
+GPT6_MAX_IMAGES = 40
+#: Planner types without the escalation wrapper.
+ALONE_PLANNERS = ("qwen", "gpt6")
+#: What RPent logs when the image cap and the reasoning-id switch are on (rpent/planner/api_loop.py).
+IMAGE_CAP_LOG = "history images: at most {n} per request (RPENT_MAX_HISTORY_IMAGES)"
+NO_IDS_LOG = "earlier response item ids are not sent back (RPENT_SEND_REASONING_IDS=0)"
 
 FT_DEFAULTS: dict[str, Any] = {
     "seeds": [1, 2, 3],
@@ -106,6 +137,15 @@ FT_DEFAULTS: dict[str, Any] = {
     "allow_product_mismatch": False,
     "endpoints": [],  # replaces [[endpoints]] for this stage when set
     "scheduler": {},  # overrides of [scheduler] for this stage
+    # Start servers on GPUs that hold only this machine's ECC processes when their memory fits.
+    "share_own_gpus": False,
+    "gpu_apps_cmd": [
+        "nvidia-smi",
+        "--query-compute-apps=gpu_uuid,pid,used_memory",
+        "--format=csv,noheader,nounits",
+    ],
+    "gpu_uuid_cmd": ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+    "own_process_prefixes": [],  # executables that count as this machine's ECC processes (empty: paths.venv)
     "pairs": [],  # default --pair list, e.g. [["s3_rules_corr", "s2_rules"]]
     "permutations": 100000,
     "bootstrap": 10000,
@@ -137,6 +177,8 @@ ARM_KEYS = {
     "errors",
     "corrections",
     "note",
+    "max_images",
+    "reasoning_ids",
 }
 
 EXAMPLE_CONFIG = """\
@@ -152,6 +194,7 @@ cell_order = "seed_major"          # seed 1 of every task first, then seed 2, ..
 infra_retries = 2                  # relaunches after an invalid result (never counted as a failure)
 render_retries = 6
 evidence_policy = "stop"           # a launch whose escalation log does not match its arm stops new launches
+# share_own_gpus = true            # claim a GPU busy only with this machine's ECC processes once this run's plan fits
 pairs = [["s3_rules_corr", "s2_rules"]]
 # launcher = ["bash", "/path/to/ecc-code/scripts/ecc_robocasa/hybrid_cell.sh"]   # the default
 
@@ -186,6 +229,12 @@ errors = 2
 [final_test.arms.qwen_only]        # Qwen alone with the cloud memory (the Target50 Qwen-only arm)
 planner = "qwen"
 memory = "cloud"
+
+# [final_test.arms.gpt6_only]      # GPT-6 (senior.model at senior.reasoning_effort) on every turn, cloud memory
+# planner = "gpt6"
+# memory = "cloud"
+# max_images = 40                  # images per request (the gateway rejects 64-80); the senior's cap
+# reasoning_ids = false            # send no ids of earlier response items, as the senior's requests
 
 [final_test.arms.gpt6_plan_k12]    # ladder rung 2 for every task
 planner = "hybrid"
@@ -224,8 +273,16 @@ def validate_arm(name: str, arm: Mapping[str, Any]) -> None:
     if unknown:
         raise ValueError(f"arm {name}: unknown keys {sorted(unknown)}")
     planner = arm.get("planner")
-    if planner not in ("hybrid", "qwen"):
-        raise ValueError(f"arm {name}: planner must be 'hybrid' or 'qwen'")
+    if planner not in ("hybrid", *ALONE_PLANNERS):
+        raise ValueError(f"arm {name}: planner must be 'hybrid', 'qwen' or 'gpt6'")
+    alone_keys = sorted(k for k in ("max_images", "reasoning_ids") if k in arm)
+    if planner != "gpt6" and alone_keys:
+        raise ValueError(f"arm {name}: {alone_keys} apply to a GPT-6-alone arm only")
+    images = arm.get("max_images", GPT6_MAX_IMAGES)
+    if not isinstance(images, int) or isinstance(images, bool) or images < 1:
+        raise ValueError(f"arm {name}: max_images must be a positive integer")
+    if not isinstance(arm.get("reasoning_ids", False), bool):
+        raise ValueError(f"arm {name}: reasoning_ids must be true or false")
     memory = arm.get("memory")
     if not isinstance(memory, str) or not (
         memory in ("s1", "cloud") or os.path.isabs(memory)
@@ -237,10 +294,11 @@ def validate_arm(name: str, arm: Mapping[str, Any]) -> None:
     if corrections not in ("none", "s3"):
         raise ValueError(f"arm {name}: corrections must be 'none' or 's3'")
     fixed = sorted(k for k in ("plan", "checkin", "errors") if k in arm)
-    if planner == "qwen":
+    if planner in ALONE_PLANNERS:
         if "rule" in arm or fixed or corrections != "none":
+            who = "Qwen-alone" if planner == "qwen" else "GPT-6-alone"
             raise ValueError(
-                f"arm {name}: a Qwen-alone arm has no senior: no rule, plan/checkin/errors or corrections"
+                f"arm {name}: a {who} arm has no senior: no rule, plan/checkin/errors or corrections"
             )
         return
     if arm.get("rule") == "s2":
@@ -289,6 +347,13 @@ def validate_final_test(cfg: Mapping[str, Any]) -> None:
     for key in ("infra_retries", "render_retries"):
         if not isinstance(ft[key], int) or ft[key] < 0:
             raise ValueError(f"final_test.{key} must be a nonnegative integer")
+    if not isinstance(ft["share_own_gpus"], bool):
+        raise ValueError("final_test.share_own_gpus must be true or false")
+    for key in ("gpu_apps_cmd", "gpu_uuid_cmd", "own_process_prefixes"):
+        if not isinstance(ft[key], list) or not all(
+            isinstance(v, str) and v for v in ft[key]
+        ):
+            raise ValueError(f"final_test.{key} must be a list of strings")
     unknown_splits = set(ft["timeout_s_by_split"]) - set(C.SPLITS)
     if unknown_splits:
         raise ValueError(
@@ -343,6 +408,28 @@ def launcher_runs_qwen_alone(cfg: Mapping[str, Any]) -> bool:
         return QWEN_SWITCH in launcher_script(cfg).read_text(errors="replace")
     except OSError:
         return False
+
+
+def launcher_runs_gpt6_alone(cfg: Mapping[str, Any]) -> bool:
+    """Whether the launcher honours ``ECC_RC_SENIOR_ALONE=1`` (needed by GPT-6-alone arms)."""
+    try:
+        text = launcher_script(cfg).read_text(errors="replace")
+    except OSError:
+        return False
+    return QWEN_SWITCH in text and ALONE_SWITCH in text
+
+
+def unsupported_alone_arms(cfg: Mapping[str, Any], arms: list[str]) -> list[str]:
+    """Run arms whose planner switch the launcher lacks (it would run them as hybrid episodes)."""
+    ft = cfg["final_test"]
+    out = []
+    for arm in arms:
+        planner = ft["arms"][arm]["planner"]
+        if (planner == "qwen" and not launcher_runs_qwen_alone(cfg)) or (
+            planner == "gpt6" and not launcher_runs_gpt6_alone(cfg)
+        ):
+            out.append(arm)
+    return out
 
 
 def config_row_supported() -> bool:
@@ -802,6 +889,14 @@ def resolve_knobs(
         "rule_source": None,
         "corrections": None,
     }
+    if arm["planner"] == "gpt6":
+        # The only planner: the senior's model, effort and route.
+        knobs.update(
+            model=str(cfg["senior"]["model"]),
+            reasoning_effort=str(cfg["senior"]["reasoning_effort"]),
+            max_images=int(arm.get("max_images", GPT6_MAX_IMAGES)),
+            reasoning_ids=bool(arm.get("reasoning_ids", False)),
+        )
     if arm["planner"] == "hybrid":
         if arm["rule"] == "s2":
             rule = inputs["rules"][job.task]
@@ -849,7 +944,7 @@ def cell_env(
     corr = knobs["corrections"]
     if knobs["escalation"]:
         rule = knobs_rule(knobs)
-    else:  # Qwen alone: the routing values are unused; the launcher turns the senior off
+    else:  # Qwen or GPT-6 alone: the routing values are unused; the launcher turns the senior off
         rule = HE.Rule(plan=True, checkin=int(cfg["senior"]["checkin"]), errors=2)
     env = HE.hybrid_env(
         cfg,
@@ -863,6 +958,14 @@ def cell_env(
         parent=parent,
     )
     env[QWEN_SWITCH] = "1" if knobs["escalation"] else "0"
+    if knobs["planner"] == "gpt6":
+        env.update(
+            {
+                ALONE_SWITCH: "1",
+                "ECC_RC_MAX_IMAGES": str(knobs["max_images"]),
+                "ECC_RC_REASONING_IDS": "1" if knobs["reasoning_ids"] else "0",
+            }
+        )
     return env
 
 
@@ -947,6 +1050,265 @@ def qwen_alone_evidence(try_dir: Path) -> dict[str, Any]:
     }
 
 
+def senior_alone_usage(try_dir: Path, pricing: Mapping[str, float]) -> dict[str, Any]:
+    """Tokens and list-price USD of a GPT-6-alone launch, which writes no escalation log.
+
+    RPent's transcript stats count every returned request, a last reply without a
+    tool call included; after a planner timeout the transcript keeps no stats and
+    the last ``[usage]`` line of ``run.log`` is used (it misses only such a last
+    reply). Every request is a GPT-6 request, priced as the senior's: cached
+    input at the cached price.
+    """
+    stats: Mapping[str, Any] = {}
+    for path in sorted(try_dir.glob("transcript_*.json"))[-1:]:
+        doc = C.read_json(path, {})
+        if isinstance(doc, Mapping) and isinstance(doc.get("stats"), Mapping):
+            if "requests" in doc["stats"]:
+                stats = doc["stats"]
+    if stats:
+        source = "transcript"
+        tokens_in = int(stats.get("total_input_tokens") or 0)
+        cached = int(stats.get("cache_read_tokens") or 0)
+        tokens_out = int(stats.get("total_output_tokens") or 0)
+        requests = int(stats.get("requests") or 0)
+    else:
+        source = "run.log"
+        log = C.usage_from_run_log(try_dir / "run.log")
+        tokens_in, tokens_out, requests = (
+            log["input_tokens"],
+            log["output_tokens"],
+            log["requests"],
+        )
+        cached = sum(int(s.get("cache_read_tokens") or 0) for s in log["sessions"])
+    usd = (
+        (tokens_in - cached) * pricing["senior_input_per_mtok"]
+        + cached * pricing["senior_cached_input_per_mtok"]
+        + tokens_out * pricing["senior_output_per_mtok"]
+    ) / 1e6
+    return {
+        "source": source,
+        "planner": "gpt6",
+        "worker_in": 0,
+        "worker_out": 0,
+        "worker_calls": 0,
+        "senior_in": tokens_in,
+        "senior_cached": cached,
+        "senior_out": tokens_out,
+        "senior_calls": requests,
+        "worker_usd": 0.0,
+        "senior_usd": usd,
+        "usd": usd,
+    }
+
+
+def senior_alone_evidence(
+    try_dir: Path, knobs: Mapping[str, Any], pricing: Mapping[str, float]
+) -> dict[str, Any]:
+    """A GPT-6-alone launch: no escalation wrapper, RPent ran the senior's model with the image cap.
+
+    With a valid result, ``result.json`` must name the api planner with the
+    senior's model and effort, and ``run.log`` must show the image cap (and, with
+    ``reasoning_ids`` off, the reasoning-id switch) RPent logs when it builds the
+    planner. Every returned request counts as a GPT-6 call (reason ``planner``).
+    """
+    log = try_dir / "escalation.jsonl"
+    problems = []
+    if log.exists():
+        problems.append(
+            "escalation.jsonl exists, but this arm runs GPT-6 alone (the launcher kept the escalation wrapper)"
+        )
+    planner: Mapping[str, Any] = {}
+    if C.read_outcome(try_dir).get("valid"):
+        result = C.read_json(try_dir / "result.json", {}) or {}
+        if isinstance(result.get("planner"), Mapping):
+            planner = result["planner"]
+        for key, want in (
+            ("backend", "api"),
+            ("model", knobs["model"]),
+            ("reasoning_effort", knobs["reasoning_effort"]),
+        ):
+            if planner.get(key) != want:
+                problems.append(
+                    f"result.json planner {key}={planner.get(key)!r}, expected {want!r}"
+                )
+        try:
+            text = (try_dir / "run.log").read_text(errors="replace")
+        except OSError:
+            text = ""
+        if IMAGE_CAP_LOG.format(n=knobs["max_images"]) not in text:
+            problems.append(
+                f"run.log does not show the {knobs['max_images']}-image cap (RPENT_MAX_HISTORY_IMAGES)"
+            )
+        if not knobs["reasoning_ids"] and NO_IDS_LOG not in text:
+            problems.append(
+                "run.log does not show that response item ids are off (RPENT_SEND_REASONING_IDS)"
+            )
+    usage = senior_alone_usage(try_dir, pricing)
+    calls = int(usage["senior_calls"])
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "evidence": {
+            "log": log.exists(),
+            "config_row": None,
+            "planner": dict(planner),
+            "usage_source": usage["source"],
+        },
+        "counts": {
+            "requests": calls,
+            "senior_calls": calls,
+            "senior_by_reason": {
+                **dict.fromkeys(HE.SENIOR_REASONS, 0),
+                "planner": calls,
+            },
+            "errors_trigger": 0,
+        },
+    }
+
+
+def is_alone_usage(usage: Any) -> bool:
+    """Whether a launch's recorded usage was priced as a GPT-6-alone launch."""
+    return isinstance(usage, Mapping) and usage.get("planner") == "gpt6"
+
+
+# ---------------------------------------------------------------------------
+# GPUs shared with this machine's other ECC runs (final_test.share_own_gpus)
+# ---------------------------------------------------------------------------
+
+
+def gpu_processes(cfg: Mapping[str, Any]) -> dict[int, list[tuple[int, int]]]:
+    """``{gpu index: [(pid, used MiB), ...]}`` of the compute processes nvidia-smi lists."""
+    ft = cfg["final_test"]
+
+    def query(argv: list[str]) -> list[list[str]]:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            raise RuntimeError(f"{argv[0]} failed: {out.stderr.strip()[:300]}")
+        return [
+            [p.strip() for p in line.split(",")]
+            for line in out.stdout.splitlines()
+            if line.strip()
+        ]
+
+    index = {
+        row[1]: int(row[0])
+        for row in query(ft["gpu_uuid_cmd"])
+        if len(row) >= 2 and row[0].isdigit()
+    }
+    procs: dict[int, list[tuple[int, int]]] = {}
+    for row in query(ft["gpu_apps_cmd"]):
+        if len(row) < 3 or row[0] not in index or not row[1].isdigit():
+            continue
+        used = int(float(re.sub(r"[^0-9.]", "", row[2]) or 0))
+        procs.setdefault(index[row[0]], []).append((int(row[1]), used))
+    return procs
+
+
+def own_process(cfg: Mapping[str, Any], pid: int) -> bool:
+    """Whether ``pid``'s executable (argv[0], as started) lies under ``own_process_prefixes``.
+
+    The default prefix is ``paths.venv``: this machine's RLDX servers and episode
+    env servers run the venv's Python. A process whose command line cannot be read
+    (another user's or container's) is not ours.
+    """
+    prefixes = list(cfg["final_test"]["own_process_prefixes"]) or [
+        str(cfg["paths"].get("venv") or "")
+    ]
+    argv = C._cmdline(pid) or []
+    if not argv:
+        return False
+    bases = {b.rstrip(os.sep) for p in prefixes if p for b in (p, os.path.realpath(p))}
+    return any(argv[0] == b or argv[0].startswith(b + os.sep) for b in bases)
+
+
+def shared_gpu_room(
+    cfg: Mapping[str, Any],
+    gpu: int,
+    need_mb: int,
+    usage: Mapping[int, Mapping[str, Any]],
+    procs: Mapping[int, list[tuple[int, int]]],
+) -> tuple[bool, str]:
+    """Whether a busy ``gpu`` holds only this machine's ECC processes and ``need_mb`` more MiB fit.
+
+    Memory that no listed process accounts for (another container's) must stay
+    below ``gpus.max_used_mb``, as on a free GPU; utilization is not checked
+    (the other run's servers keep the GPU busy).
+    """
+    if gpu not in cfg["gpus"]["allowed"]:
+        return False, f"GPU {gpu} is not allowed ({cfg['gpus']['allowed']})"
+    row = usage.get(gpu)
+    if row is None or "used_mb" not in row or not row.get("total_mb"):
+        return False, f"GPU {gpu} memory total/used not reported by nvidia-smi"
+    mine = procs.get(gpu, [])
+    foreign = [pid for pid, _ in mine if not own_process(cfg, pid)]
+    if foreign:
+        return (
+            False,
+            f"GPU {gpu} runs {len(foreign)} process(es) not started from this machine's ECC venv",
+        )
+    used = max(row["used_mb"], row.get("csv_used_mb", 0))
+    unaccounted = used - sum(mb for _, mb in mine)
+    if unaccounted >= int(cfg["gpus"]["max_used_mb"]):
+        return False, f"GPU {gpu}: {unaccounted} MiB used by processes not visible here"
+    room = row["total_mb"] - used
+    if room < need_mb:
+        return (
+            False,
+            f"GPU {gpu} shared with our other runs: {room} MiB free, {need_mb} MiB needed",
+        )
+    return True, (
+        f"GPU {gpu} shared with our other runs ({len(mine)} processes); {room} MiB free >= {need_mb} MiB"
+    )
+
+
+class FinalServerPool(C.ServerPool):
+    """``common.ServerPool``; with ``final_test.share_own_gpus`` a GPU busy only with this
+    machine's ECC processes is claimed when this run's servers and slots on it fit.
+
+    The plan of a newly claimed GPU is every endpoint of this run on it (server_mb
+    per server, cell_mb per slot) plus ``servers.fit_margin_mb``; the servers.max_gpus
+    limit and the port check apply as before, and a GPU this run already holds keeps
+    the base rule (room for one more server).
+    """
+
+    def _start(
+        self,
+        ep: C.Endpoint,
+        usage: Mapping[int, Mapping[str, Any]] | None,
+        forced: bool,
+    ) -> str:
+        cfg = self.cfg
+        if forced or not cfg["final_test"]["share_own_gpus"] or usage is None:
+            return super()._start(ep, usage, forced)
+        held = self.held_gpus(exclude=ep)
+        max_gpus = int(cfg["servers"].get("max_gpus") or 0)
+        if ep.gpu in held or (max_gpus and len(held) >= max_gpus):
+            return super()._start(ep, usage, forced)
+        if C.gpu_free(cfg, ep.gpu, usage)[0]:
+            return super()._start(ep, usage, forced)
+        servers = cfg["servers"]
+        need = int(servers["fit_margin_mb"]) + sum(
+            int(servers["server_mb"]) + e.slots * int(servers["cell_mb"])
+            for e in self.endpoints
+            if e.gpu == ep.gpu
+        )
+        try:
+            ok, reason = shared_gpu_room(cfg, ep.gpu, need, usage, gpu_processes(cfg))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            ok, reason = False, f"GPU process query failed: {exc}"
+        self.log(
+            {
+                "event": "server_shared_gpu" if ok else "server_refused",
+                "endpoint": ep.name,
+                "reason": reason,
+            }
+        )
+        if not ok:
+            ep.up, ep.note = False, reason
+            return "refused"
+        return super()._start(ep, usage, True)
+
+
 # ---------------------------------------------------------------------------
 # the stage
 # ---------------------------------------------------------------------------
@@ -991,6 +1353,38 @@ class FinalTest(C.Stage):
 
     def budget_launches(self) -> int:
         return len(self._jobs)
+
+    def alone(self, job_id: str) -> bool:
+        """Whether the job runs GPT-6 alone (its usage is priced as the senior's)."""
+        return self.knobs[job_id]["planner"] == "gpt6"
+
+    def try_usage(self, job_id: str, entry: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Usage of one launch: as recorded, except GPT-6-alone launches, priced from their files.
+
+        ``common.Scheduler`` records every launch with ``common.episode_usage``,
+        which prices a launch without an escalation log at the worker's price.
+        """
+        usage = entry.get("usage")
+        if not self.alone(job_id) or is_alone_usage(usage):
+            return usage
+        if not Path(entry["dir"]).exists():
+            return usage
+        return senior_alone_usage(Path(entry["dir"]), self.cfg["pricing"])
+
+    def total_cost(self, states: Mapping[str, Mapping[str, Any]]) -> float:
+        """``common.total_cost`` with GPT-6-alone launches priced as the senior's."""
+        usd = 0.0
+        for job_id, state in states.items():
+            for entry in state["tries"]:
+                usage = self.try_usage(job_id, entry)
+                if (
+                    usage is None
+                    and entry.get("status") in ("launching", "running")
+                    and Path(entry["dir"]).exists()
+                ):
+                    usage = C.episode_usage(Path(entry["dir"]), self.cfg["pricing"])
+                usd += float((usage or {}).get("usd") or 0.0)
+        return usd
 
     def expected(self, job: C.Job) -> dict[str, Any] | None:
         """What the escalation log must show (``hybrid_episode.expected_routing``); None for Qwen alone."""
@@ -1062,7 +1456,11 @@ class FinalTest(C.Stage):
         """
         try_dir = self.try_dir(job, n)
         expected = self.expected(job)
-        if expected is None:
+        if self.alone(job.job_id):
+            result = senior_alone_evidence(
+                try_dir, self.knobs[job.job_id], self.cfg["pricing"]
+            )
+        elif expected is None:
             result = qwen_alone_evidence(try_dir)
         else:
             result = HE.check_escalation(
@@ -1129,8 +1527,14 @@ class FinalTest(C.Stage):
             check = C.read_json(
                 self.job_dir(job) / f"try{final['try']}.evidence.json"
             ) or self.evidence(job, final["try"])
+        usages = [self.try_usage(job.job_id, t) for t in state["tries"]]
         episode = (
-            HE.episode_record(try_dir, self.cfg["pricing"], check)
+            HE.episode_record(
+                try_dir,
+                self.cfg["pricing"],
+                check,
+                usage=usages[final["try"] - 1] if self.alone(job.job_id) else None,
+            )
             if try_dir.exists()
             else {}
         )
@@ -1160,14 +1564,10 @@ class FinalTest(C.Stage):
             "evidence_ok": bool(check.get("ok")) if valid else None,
             "knobs": knobs,
             "episode": episode,
-            "usage": last.get("usage"),
-            "usd": round(float((last.get("usage") or {}).get("usd") or 0.0), 6),
+            "usage": usages[final["try"] - 1],
+            "usd": round(float((usages[final["try"] - 1] or {}).get("usd") or 0.0), 6),
             "usd_all_tries": round(
-                sum(
-                    float((t.get("usage") or {}).get("usd") or 0.0)
-                    for t in state["tries"]
-                ),
-                6,
+                sum(float((u or {}).get("usd") or 0.0) for u in usages), 6
             ),
             "error_runs": error_runs(try_dir) if try_dir.exists() else None,
             "tries": [
@@ -1215,6 +1615,49 @@ class FinalScheduler(C.Scheduler):
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self._config_checked: set[str] = set()
+        self._usage_priced = 0.0
+
+    def save(self, state: dict[str, Any]) -> None:
+        """Save a job's state; finished GPT-6-alone launches keep their usage priced as the senior's.
+
+        ``common.Scheduler.finish_try`` records ``common.episode_usage`` (the
+        worker's price for a launch without an escalation log) and saves before it
+        calls ``on_final``, so the state, the record and the cost guard all get the
+        senior's price.
+        """
+        if self.stage.alone(state["job_id"]):
+            for entry in state["tries"]:
+                if entry.get("status") == "done" and not is_alone_usage(
+                    entry.get("usage")
+                ):
+                    usage = self.stage.try_usage(state["job_id"], entry)
+                    if usage is not None:
+                        entry["usage"] = usage
+        super().save(state)
+
+    def _price_running_alone(self) -> None:
+        """Give running GPT-6-alone launches a usage snapshot priced as the senior's.
+
+        The cost guard (``common.total_cost``) prices a running launch from its
+        files at the worker's price unless the launch carries a usage, which it then
+        takes as it is; ``finish_try`` replaces the snapshot when the launch ends.
+        """
+        if time.time() - self._usage_priced < float(self.sched["cost_check_s"]):
+            return
+        self._usage_priced = time.time()
+        for job_id in self.jobs:
+            if not self.stage.alone(job_id):
+                continue
+            state = self.state(job_id)
+            last = state["tries"][-1] if state["tries"] else None
+            if not last or last.get("status") != "running":
+                continue
+            if Path(last["dir"]).exists():
+                last["usage"] = {
+                    **senior_alone_usage(Path(last["dir"]), self.cfg["pricing"]),
+                    "partial": True,
+                }
+                self.save(state)
 
     def _mismatch(
         self, job_id: str, last: Mapping[str, Any], problems: list[str], when: str
@@ -1274,6 +1717,7 @@ class FinalScheduler(C.Scheduler):
                     C.kill_group(
                         int(last["pid"]), grace_s=float(self.sched["kill_grace_s"])
                     )
+        self._price_running_alone()
 
     def finish_try(
         self, job_id: str, state: dict[str, Any], exit_code: int | None
@@ -1818,12 +2262,14 @@ def print_plan(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
     print(
         f"  launcher {' '.join(cell_argv(run_cfg))} ({'exists' if script.is_file() else 'MISSING'})"
     )
-    qwen_arms = [a for a in arms if ft["arms"][a]["planner"] == "qwen"]
-    if qwen_arms and not launcher_runs_qwen_alone(run_cfg):
+    alone_arms = [a for a in arms if ft["arms"][a]["planner"] in ALONE_PLANNERS]
+    missing = unsupported_alone_arms(run_cfg, arms)
+    if missing:
         print(
-            f"  WARNING  arms {qwen_arms} run Qwen alone, but the launcher has no {QWEN_SWITCH} switch: --go refuses"
+            f"  WARNING  arms {missing} run one planner alone, but the launcher lacks the "
+            f"{QWEN_SWITCH} / {ALONE_SWITCH} switch: --go refuses"
         )
-    if len(qwen_arms) < len(arms) and ft["require_config_row"]:
+    if len(alone_arms) < len(arms) and ft["require_config_row"]:
         try:
             supported = config_row_supported()
         except Exception as exc:  # noqa: BLE001 - dry run reports and goes on
@@ -1841,12 +2287,29 @@ def print_plan(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - dry run reports and goes on
         usage = None
         print(f"  GPUs     query failed: {exc}")
+    procs = None
+    if ft["share_own_gpus"] and usage is not None:
+        try:
+            procs = gpu_processes(run_cfg)
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            print(f"  GPUs     process query failed: {exc}")
+    servers = run_cfg["servers"]
     for ep in C.endpoints_from_config(run_cfg):
         free = (
             C.gpu_free(run_cfg, ep.gpu, usage)[1]
             if usage is not None
             else "not checked"
         )
+        if procs is not None and not C.gpu_free(run_cfg, ep.gpu, usage)[0]:
+            need = int(servers["fit_margin_mb"]) + sum(
+                int(servers["server_mb"]) + e.slots * int(servers["cell_mb"])
+                for e in C.endpoints_from_config(run_cfg)
+                if e.gpu == ep.gpu
+            )
+            free += (
+                "; share_own_gpus: "
+                + shared_gpu_room(run_cfg, ep.gpu, need, usage, procs)[1]
+            )
         print(f"  endpoint {ep.name}: port {ep.port}, {ep.slots} slots; {free}")
     cred = Path(run_cfg["credentials"].get("file") or "")
     if cred.name:
@@ -1858,6 +2321,13 @@ def print_plan(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
     for job in jobs[: max(2, len(arms))]:
         k = stage.knobs[job.job_id]
         corr = k["corrections"]
+        if k["planner"] == "gpt6":
+            print(
+                f"    {job.job_id}: GPT-6 alone ({k['model']}, effort {k['reasoning_effort']}, at most "
+                f"{k['max_images']} images per request, reasoning ids {'sent' if k['reasoning_ids'] else 'off'}), "
+                f"memory {k['memory']}, timeout {k['timeout_s']} s"
+            )
+            continue
         print(
             f"    {job.job_id}: senior {'on' if k['escalation'] else 'off'}, plan {k['plan']}, K {k['checkin']}, "
             f"N {k['errors']} (rung {k['rung']}, {k['rule_source']}), memory {k['memory']}, corrections "
@@ -1913,14 +2383,17 @@ def cmd_run(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
         raise SystemExit(
             f"the cell launcher {launcher_script(run_cfg)} does not exist (final_test.launcher)"
         )
-    qwen_arms = [a for a in ft["run_arms"] if ft["arms"][a]["planner"] == "qwen"]
-    if qwen_arms and not launcher_runs_qwen_alone(run_cfg):
+    alone_arms = [
+        a for a in ft["run_arms"] if ft["arms"][a]["planner"] in ALONE_PLANNERS
+    ]
+    missing = unsupported_alone_arms(run_cfg, ft["run_arms"])
+    if missing:
         raise SystemExit(
-            f"arms {qwen_arms} run Qwen alone, but {launcher_script(run_cfg)} has no {QWEN_SWITCH} switch "
-            "(it would run them with the senior)"
+            f"arms {missing} run one planner alone, but {launcher_script(run_cfg)} lacks the {QWEN_SWITCH} / "
+            f"{ALONE_SWITCH} switch (it would run them as hybrid episodes)"
         )
     if (
-        len(qwen_arms) < len(ft["run_arms"])
+        len(alone_arms) < len(ft["run_arms"])
         and ft["require_config_row"]
         and not config_row_supported()
     ):
@@ -1996,7 +2469,7 @@ def cmd_run(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
             {k: v for k, v in run_cfg.items() if k != "_path"},
         )
         C.atomic_write_json(layout.manifest, manifest)
-    servers = C.ServerPool(
+    servers = FinalServerPool(
         run_cfg,
         layout,
         S1.base_env(run_cfg),
@@ -2035,9 +2508,21 @@ def cmd_run(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
         flush=True,
     )
     result = "no_endpoint" if pending else "done"
+    # With share_own_gpus a server refused for lack of room is tried again every
+    # servers.retry_busy_s (at most servers.max_refusals times) inside the run loop,
+    # so the runner waits for room instead of exiting with no endpoint up.
+    waiting = bool(
+        ft["share_own_gpus"] and pending and not up and servers.restart_after
+    )
+    if waiting:
+        print(
+            f"no endpoint up yet: waiting for GPU room (a refused server is tried again every "
+            f"{run_cfg['servers']['retry_busy_s']} s, at most {run_cfg['servers']['max_refusals']} times)",
+            flush=True,
+        )
     stage.cells_dir.mkdir(parents=True, exist_ok=True)
     try:
-        if up or scheduler.running(states):
+        if up or scheduler.running(states) or waiting:
             # Episodes cannot list cells/ while they run, so another arm's folder is not discoverable.
             stage.cells_dir.chmod(0o311)
             result = scheduler.run()
@@ -2133,9 +2618,7 @@ def cmd_status(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
         )
     if mismatches:
         print(f"  evidence mismatches: {', '.join(sorted(mismatches)[:6])}")
-    print(
-        f"  cost so far (list price, all launches): ${C.total_cost(states, run_cfg['pricing']):.2f}"
-    )
+    print(f"  cost so far (list price, all launches): ${stage.total_cost(states):.2f}")
     return 0
 
 

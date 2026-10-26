@@ -335,7 +335,7 @@ empty when there are none) and `<Task>.json`, with `PRODUCT.json` (schema `rc-ec
 
 # The final test (`final_test.py`)
 
-`final_test.py` runs named arms (`[final_test.arms.<name>]`: planner hybrid or qwen, memory s1 /
+`final_test.py` runs named arms (`[final_test.arms.<name>]`: planner hybrid, qwen or gpt6, memory s1 /
 cloud / a path, rule s2 or fixed plan/K/N, corrections none or s3) over task x seed x repeat cells,
 with the arms of a cell launched next to each other in a seeded order. Every input product is
 verified with its stage's `verify`, checked to be built on the others, and copied read-only into
@@ -345,6 +345,21 @@ Qwen-alone arms, as the Target50 launcher's `ABL_ESCALATION=0`) and get stage 2'
 trigger fired, cost per episode and per success, and paired tests (McNemar on cells, a sign test
 over tasks, a task-clustered sign-flip test, a bootstrap interval). `final_test.py example-config`
 prints a `[final_test]` section.
+
+A `gpt6` arm runs the senior's model alone on every turn: `ECC_RC_SENIOR_ALONE=1` makes
+`hybrid_cell.sh` start RPent's api planner with `senior.model` at `senior.reasoning_effort`, the
+senior's base URL and key, and no escalation wrapper. `max_images` (default 40) becomes
+`RPENT_MAX_HISTORY_IMAGES`, since the gateway rejects requests above 64-80 images and the 4 MiB
+history budget keeps up to about 100 RoboCasa frames; `reasoning_ids = false` (the default) sets
+`RPENT_SEND_REASONING_IDS=0`, as the senior's requests. Its evidence check wants no escalation log,
+the model and effort in `result.json` and both settings in `run.log`. Its GPT-6 calls are every
+returned request (transcript stats, or `run.log` after a planner timeout), priced at the senior's
+list price in the records and the cost guard.
+
+`final_test.share_own_gpus = true` lets the runner claim a GPU that holds only this machine's ECC
+processes (started from `paths.venv`) when its free memory covers this run's servers and slots
+on it plus `servers.fit_margin_mb`; until then the servers are tried again every
+`servers.retry_busy_s` and the runner waits instead of exiting.
 
 # Chaining the stages (`chain.py`)
 

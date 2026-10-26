@@ -27,6 +27,12 @@
 #     missing one) and, with ECC_RC_CORRECTIONS_SHA256, must have that sha256; it becomes RPENT_CLOUD_CORRECTIONS;
 #   - optional ECC_RC_ESCALATION=0 (final-test Qwen-alone arms only): no senior at all, as the launcher's
 #     ABL_ESCALATION=0; unset or 1 keeps the hybrid planner;
+#   - optional ECC_RC_SENIOR_ALONE=1 with ECC_RC_ESCALATION=0 (final-test GPT-6-alone arms only): the senior's
+#     model plans every turn (--model ECC_RC_SENIOR_MODEL, --reasoning-effort ECC_RC_SENIOR_EFFORT) through the
+#     senior's base URL and key (OPENAI_BASE_URL/OPENAI_API_KEY); ECC_RC_MAX_IMAGES (a positive integer)
+#     becomes RPENT_MAX_HISTORY_IMAGES, since the gateway rejects requests above 64-80 images; with
+#     ECC_RC_REASONING_IDS=0 (the default) RPENT_SEND_REASONING_IDS=0, as the senior's requests;
+#     ECC_RC_SENIOR_ALONE unset or 0 keeps the worker as the planner;
 #   - PYTHONPATH and RPENT_REPO_ROOT point at the ECC checkout, which is also the working directory;
 #   - --memory-dir is a frozen corpus that must not be writable (evaluation reads memory read-only anyway),
 #     --planner-timeout-s is ECC_RC_TIMEOUT_S, the RLDX server is always a shared endpoint.
@@ -47,6 +53,14 @@ case "$SPLIT" in atomic|composite_seen|composite_unseen) ;; *) echo "bad split $
 case "$ECC_RC_PLAN" in 0|1) ;; *) echo "hybrid_cell: ECC_RC_PLAN must be 0 or 1" >&2; exit 2 ;; esac
 case "${ECC_RC_ESCALATION:-1}" in 0|1) ;; *) echo "hybrid_cell: ECC_RC_ESCALATION must be 0 or 1" >&2; exit 2 ;; esac
 SENIOR=on; NOTE=""; [ "${ECC_RC_ESCALATION:-1}" = 0 ] && SENIOR=off NOTE=" senior=off"
+case "${ECC_RC_SENIOR_ALONE:-0}" in 0|1) ;; *) echo "hybrid_cell: ECC_RC_SENIOR_ALONE must be 0 or 1" >&2; exit 2 ;; esac
+ALONE=${ECC_RC_SENIOR_ALONE:-0}
+if [ "$ALONE" = 1 ]; then
+  [ "$SENIOR" = off ] || { echo "hybrid_cell: ECC_RC_SENIOR_ALONE=1 needs ECC_RC_ESCALATION=0 (no escalation wrapper)" >&2; exit 2; }
+  [[ "${ECC_RC_MAX_IMAGES:-}" =~ ^[1-9][0-9]*$ ]] || { echo "hybrid_cell: ECC_RC_MAX_IMAGES must be a positive integer" >&2; exit 2; }
+  case "${ECC_RC_REASONING_IDS:-0}" in 0|1) ;; *) echo "hybrid_cell: ECC_RC_REASONING_IDS must be 0 or 1" >&2; exit 2 ;; esac
+  NOTE="$NOTE planner=$ECC_RC_SENIOR_MODEL effort=$ECC_RC_SENIOR_EFFORT images=$ECC_RC_MAX_IMAGES reasoning_ids=${ECC_RC_REASONING_IDS:-0}"
+fi
 for v in ECC_RC_CHECKIN ECC_RC_ERRORS ECC_RC_TIMEOUT_S ECC_RC_MAX_TURNS; do
   [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || { echo "hybrid_cell: $v must be a positive integer" >&2; exit 2; }
 done
@@ -85,6 +99,13 @@ if [ "$SENIOR" = off ]; then
   [ -z "$CORRECTIONS" ] || { echo "hybrid_cell: cloud corrections need the senior (ECC_RC_ESCALATION=0)" >&2; exit 2; }
   export RPENT_ESCALATION=0
 fi
+# GPT-6 alone (final-test arms): the senior's model is the only planner, on the senior's route and key; Qwen's
+# thinking switch is never sent (RPent adds it only for a Qwen chat model).
+if [ "$ALONE" = 1 ]; then
+  export OPENAI_API_KEY="${!ECC_RC_SENIOR_KEY_VAR}" OPENAI_BASE_URL="${!ECC_RC_SENIOR_BASE_URL_VAR}" \
+         RPENT_MAX_HISTORY_IMAGES="$ECC_RC_MAX_IMAGES"
+  [ "${ECC_RC_REASONING_IDS:-0}" = 0 ] && export RPENT_SEND_REASONING_IDS=0
+fi
 export RLDX_MAX_CHUNKS=40 RLDX_SETTLE_PATIENCE=999 RLDX_ACTION_STEPS_PER_CHUNK=8
 unset RLDX_RESET_SEED
 export ROBOCASA_ASSETS_PATH="$ECC_RC_ASSETS" HF_HOME="$ECC_RC_HF_HOME" HF_HUB_CACHE="$ECC_RC_HF_HOME/hub"
@@ -108,6 +129,7 @@ for name in ("rpent", "robots"):
         sys.exit(f"{name} resolves to {origin or 'nothing'}")
 PY
 TIMEOUT=$ECC_RC_TIMEOUT_S; TURNS=$ECC_RC_MAX_TURNS; MODEL=$ECC_RC_WORKER_MODEL; EFFORT=$ECC_RC_WORKER_EFFORT
+[ "$ALONE" = 1 ] && MODEL=$ECC_RC_SENIOR_MODEL EFFORT=$ECC_RC_SENIOR_EFFORT
 echo "hybrid_cell: $TASK seed $SEED plan=$ECC_RC_PLAN checkin=$ECC_RC_CHECKIN errors=$ECC_RC_ERRORS" \
      "corrections=${CORRECTIONS:-none} timeout=${TIMEOUT}s turns=$TURNS$NOTE"
 mkdir -p "$OUT"
