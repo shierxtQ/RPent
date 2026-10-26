@@ -599,3 +599,12 @@ RLDX 连续性和失败 attempt 归档规则。
 使用 seed-0 探索输出，以 ``--memory-profile local`` 指向同一目录。
 必须先有已发布的 global，评测才可启动；评测使用独立的任务/split 访问边界，
 探索则保留重试和 inbox 工作流程。
+
+设置 ``RPENT_MEMORY_MERGE_REPLACE=1`` 后，以已发布 corpus 为起点的探索会替换
+任务 memory，而不是再加一对文件；此时只能探索 seed 0。已解决且 audit 和 recipe
+都存在的 cell，会把该任务已发布的 ``<Task>_s0.json``、``<Task>_s0_recipe.jsonl``
+和 ``<Task>.md`` 移到 ``_internal/replaced/<Task>_s0/``，再发布自己的文件对和
+task-family 笔记。其他 cell（包括已解决但缺少 audit 的 cell）保留已发布文件，
+其 task-family 草稿移到 ``_internal/held/<cell>/``。global 草稿照常合并。在其他
+目录中探索的 cell 用 ``robots.robocasa.memory.publish_exploration_cell`` 发布；
+它持有 corpus 的 merge 锁，多个进程可以同时发布。

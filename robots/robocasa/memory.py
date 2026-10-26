@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -361,3 +363,228 @@ class RoboCasaMemoryManager(MemoryManager):
             )
             bindings[name] = (spec, handler)
         return bindings
+
+
+def _replace_from_env() -> bool:
+    return os.environ.get("RPENT_MEMORY_MERGE_REPLACE") == "1"
+
+
+class RoboCasaExplorationMemoryManager(MemoryManager):
+    """Exploration corpus manager whose replace mode follows RoboCasa names.
+
+    A RoboCasa exploration cell ``<Task>_<split>_s0`` writes its audit and
+    recipe as ``task-specific/<Task>_<split>_s0.*`` and its task note as a
+    task-family leaf. A published corpus names the same task's references
+    ``task-specific/<Task>_s0.*`` and keeps its task write-up in
+    ``task-specific/<Task>.md``; the local loader refuses a task that has
+    both pairs. Without replace mode, merges are the base merge.
+
+    In replace mode (``RPENT_MEMORY_MERGE_REPLACE=1`` or ``replace=True``)
+    only the seed-0 cell merges, and a task's memory comes from one side:
+
+    - A solved cell with a non-empty audit and a recipe replaces the task's
+      published files: they move to ``_internal/replaced/<Task>_s0/``, and
+      the cell's pair and its task-family leaf for this task and split are
+      published.
+    - Any other cell (unsolved, or solved without its audit or recipe) keeps
+      the published files and publishes no task-family leaf.
+
+    Task-family drafts that are not published move to
+    ``_internal/held/<cell>/``. Global drafts merge by the base rules either
+    way. The merge result adds ``task_memory`` (``"replaced"`` or ``"kept"``),
+    ``kept_reason``, ``archived``, ``held`` and ``selected``: the task's
+    local-profile selection after the merge.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        task_name: str,
+        split: str,
+        memory_access: str = "read_only",
+        inbox_cell_tag: str | None = None,
+    ) -> None:
+        super().__init__(
+            root, memory_access=memory_access, inbox_cell_tag=inbox_cell_tag
+        )
+        self._task_name = task_name
+        self._split = split
+        self._published = task_files(task_name)
+        self._native = local_task_files(task_name, split)
+        if (
+            inbox_cell_tag is not None
+            and inbox_cell_tag != self.cell_tag
+            and _replace_from_env()
+        ):
+            raise ValueError(
+                "RPENT_MEMORY_MERGE_REPLACE=1 publishes seed-0 references; "
+                f"explore {task_name} with --seed 0, not as {inbox_cell_tag}"
+            )
+
+    @property
+    def cell_tag(self) -> str:
+        """The seed-0 exploration cell whose files the loader reads."""
+        return Path(self._native[0]).stem
+
+    def merge_memory(
+        self,
+        *,
+        cell_tag: str,
+        run_state_dir: str | Path,
+        solved: bool,
+        replace: bool | None = None,
+    ) -> dict[str, Any]:
+        """Merge one cell; in replace mode, publish one side's task memory."""
+        if replace is None:
+            replace = _replace_from_env()
+        if not replace:
+            return super().merge_memory(
+                cell_tag=cell_tag,
+                run_state_dir=run_state_dir,
+                solved=solved,
+                replace=False,
+            )
+        if cell_tag != self.cell_tag:
+            raise ValueError(
+                f"replace mode merges only the seed-0 cell {self.cell_tag}, "
+                f"not {cell_tag}"
+            )
+        self.check_layout()
+        run_dir = Path(run_state_dir).resolve()
+        audit = run_dir / f"{cell_tag}.json"
+        recipe = run_dir / f"{cell_tag}_recipe.jsonl"
+        if not solved:
+            kept = "unsolved"
+        elif not audit.is_file() or audit.stat().st_size == 0:
+            kept = f"solved, but the explorer wrote no audit {audit.name}"
+        elif not recipe.is_file():
+            kept = f"solved, but no recipe {recipe.name} was exported"
+        else:
+            kept = None
+        with self.merge_lock():
+            held = self._hold_task_family_drafts(cell_tag, kept)
+            result = super().merge_memory(
+                cell_tag=cell_tag,
+                run_state_dir=run_dir,
+                solved=kept is None,
+                replace=True,
+            )
+            result["skipped"].extend(f"{name}: held, {why}" for name, why in held)
+            archived: list[str] = []
+            if kept is None and all(
+                (self.root / name).is_file() for name in self._native[:2]
+            ):
+                archived = self._archive_published()
+            # Like the base count: one for the audit/recipe pair, one per note.
+            notes = sum(name.endswith(".md") for name in archived)
+            result["replaced"] = (
+                result.get("replaced", 0) + notes + (len(archived) > notes)
+            )
+            result.update(
+                task_memory="kept" if kept else "replaced",
+                kept_reason=kept,
+                archived=archived,
+                held=[name for name, _ in held],
+                selected=list(
+                    TaskMemory.load(
+                        self.root,
+                        self._task_name,
+                        profile="local",
+                        split=self._split,
+                    ).selected
+                ),
+            )
+        return result
+
+    def _hold_task_family_drafts(
+        self, cell_tag: str, kept: str | None
+    ) -> list[tuple[str, str]]:
+        """Move task-family drafts that must not publish out of the inbox."""
+        inbox = self.root / "_internal" / "inbox" / cell_tag
+        identity = {
+            "suite": "robocasa",
+            "regime": self._split,
+            "task_id": self._task_name,
+        }
+        held = []
+        for source in sorted(inbox.glob("*.md")):
+            try:
+                metadata, _ = _split_frontmatter(source)
+                _validate(metadata)
+            except ValueError:
+                continue  # the base merge reports invalid drafts
+            if metadata["scope"] != "task-family":
+                continue
+            if kept is not None:
+                why = f"task memory kept ({kept})"
+            elif any(metadata.get(key) != value for key, value in identity.items()):
+                why = f"not a task-family note for {self._task_name}/{self._split}"
+            else:
+                continue
+            destination = self.root / "_internal" / "held" / cell_tag
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination / source.name))
+            held.append((source.name, why))
+        return held
+
+    def _archive_published(self) -> list[str]:
+        """Move the task's published pair and note to _internal/replaced/."""
+        archive = Path("_internal") / "replaced" / Path(self._published[0]).stem
+        archived = []
+        for name in self._published:
+            path = self.root / name
+            if path.exists() or path.is_symlink():
+                (self.root / archive).mkdir(parents=True, exist_ok=True)
+                shutil.move(str(path), str(self.root / archive / path.name))
+                archived.append((archive / path.name).as_posix())
+        return archived
+
+
+def publish_exploration_cell(
+    corpus: str | Path,
+    *,
+    task_name: str,
+    split: str,
+    run_dir: str | Path,
+    solved: bool,
+    inbox: str | Path | None = None,
+) -> dict[str, Any]:
+    """Publish one finished seed-0 exploration cell into ``corpus``, replacing.
+
+    The inbox copy and the merge hold the corpus merge lock, so concurrent
+    publishers are serialized.
+
+    Args:
+        corpus: Existing memory root to publish into.
+        task_name: RoboCasa task of the cell.
+        split: RoboCasa split of the cell.
+        run_dir: The cell's output directory, which holds the explorer's audit
+            and the exported recipe.
+        solved: The cell's environment result (``success`` in its
+            ``result.json``).
+        inbox: When the cell explored against another memory root, such as a
+            per-task staging copy run with ``--no-auto-merge-memory``, that
+            root's ``_internal/inbox/<Task>_<split>_s0``; it is copied into
+            ``corpus`` first.
+
+    Returns:
+        The merge result of :class:`RoboCasaExplorationMemoryManager`.
+
+    Raises:
+        ValueError: If ``corpus`` does not exist, or the task cannot be loaded
+            after the merge.
+    """
+    manager = RoboCasaExplorationMemoryManager(corpus, task_name=task_name, split=split)
+    if not manager.root.is_dir():
+        raise ValueError(f"RoboCasa memory directory not found: {manager.root}")
+    cell = manager.cell_tag
+    with manager.merge_lock():
+        if inbox is not None:
+            source = Path(inbox).expanduser().resolve()
+            target = manager.root / "_internal" / "inbox" / cell
+            if source.is_dir() and source != target:
+                shutil.copytree(source, target, dirs_exist_ok=True)
+        return manager.merge_memory(
+            cell_tag=cell, run_state_dir=run_dir, solved=solved, replace=True
+        )

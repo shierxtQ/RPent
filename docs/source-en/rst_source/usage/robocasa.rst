@@ -668,3 +668,15 @@ and refreshes ``MEMORY.md``. To evaluate these native files, use seed-0
 exploration output and ``--memory-profile local`` with the same directory.
 Evaluation requires global memory to have been published first and uses its
 own task/split access boundary; exploration keeps its retry and inbox workflow.
+
+With ``RPENT_MEMORY_MERGE_REPLACE=1``, exploration seeded with a published
+corpus replaces a task's memory instead of adding a second pair, and only seed
+0 can be explored. A solved cell whose audit and recipe exist moves the task's
+published ``<Task>_s0.json``, ``<Task>_s0_recipe.jsonl`` and ``<Task>.md`` to
+``_internal/replaced/<Task>_s0/`` and publishes its own pair and task-family
+note. Any other cell, including a solved one without its audit, leaves the
+published files in place, and its task-family drafts move to
+``_internal/held/<cell>/``. Global drafts merge as usual. A cell that explored
+against another directory is published with
+``robots.robocasa.memory.publish_exploration_cell``, which holds the corpus
+merge lock, so several publishers can run at once.

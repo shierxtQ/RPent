@@ -20,7 +20,9 @@ import fcntl
 import os
 import re
 import shutil
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -170,11 +172,37 @@ class MemoryManager:
         self._root = Path(root).resolve()
         self._memory_access = memory_access
         self._inbox_cell_tag = inbox_cell_tag
+        #: Thread that holds :meth:`merge_lock` through this manager, if any.
+        self._merge_lock_owner: int | None = None
 
     @property
     def root(self) -> Path:
         """Resolved corpus root."""
         return self._root
+
+    @contextmanager
+    def merge_lock(self) -> Iterator[None]:
+        """Hold the corpus-wide merge lock, ``_internal/merge.lock``.
+
+        An exclusive ``flock`` serializes merges from every process and thread
+        on this host that publishes into the corpus. Nested use by the thread
+        that holds it through this manager re-enters it, so a subclass can wrap
+        :meth:`merge_memory` in one critical section.
+        """
+        if self._merge_lock_owner == threading.get_ident():
+            yield
+            return
+        lock_path = self._root / "_internal" / "merge.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.touch(exist_ok=True)
+        with lock_path.open("r+") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            self._merge_lock_owner = threading.get_ident()
+            try:
+                yield
+            finally:
+                self._merge_lock_owner = None
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def check_layout(self) -> None:
         """Reject an unmigrated corpus instead of silently omitting its layers.
@@ -236,6 +264,7 @@ class MemoryManager:
         cell_tag: str,
         run_state_dir: str | Path,
         solved: bool,
+        replace: bool | None = None,
     ) -> dict[str, Any]:
         """Publish one cell's inbox drafts and solved task artifacts.
 
@@ -243,11 +272,12 @@ class MemoryManager:
         archived under _internal/conflicts. Solved audit/recipe pairs are
         copied to task-specific/. MEMORY.md is refreshed at the end.
 
-        With ``RPENT_MEMORY_MERGE_REPLACE=1``, a solved cell's own
-        task-family write-up and audit/recipe pair replace the ones already
-        published for it (the previous files move to _internal/replaced), so
-        an explorer seeded with another model's corpus ends up with its own
-        task memory. Global notes merge as usual.
+        In replace mode (``replace=True``; by default
+        ``RPENT_MEMORY_MERGE_REPLACE=1``), a solved cell's own task-family
+        write-up and audit/recipe pair replace the ones already published for
+        it (the previous files move to _internal/replaced), so an explorer
+        seeded with another model's corpus ends up with its own task memory.
+        Global notes merge as usual.
         """
         self.check_layout()
         root = self._root
@@ -257,7 +287,9 @@ class MemoryManager:
         conflicts = internal / "conflicts"
         merged = internal / "merged"
         replaced = internal / "replaced"
-        replace = solved and os.environ.get("RPENT_MEMORY_MERGE_REPLACE") == "1"
+        if replace is None:
+            replace = os.environ.get("RPENT_MEMORY_MERGE_REPLACE") == "1"
+        replace = solved and replace
         tiers = {
             "global": root / "global",
             "task-family": root / "task-family",
@@ -277,10 +309,7 @@ class MemoryManager:
         }
         if replace:
             result["replaced"] = 0
-        lock_path = internal / "merge.lock"
-        lock_path.touch(exist_ok=True)
-        with lock_path.open("r+") as lock_file:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        with self.merge_lock():
             published_draft = False
             for source in sorted(inbox.glob("*.md")):
                 try:
