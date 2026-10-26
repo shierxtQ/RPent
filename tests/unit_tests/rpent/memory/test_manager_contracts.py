@@ -30,7 +30,7 @@ def _write_memory_leaf(
     memory_id: str,
     scope: str,
     cells: list[str],
-    attempts: int = 1,
+    attempts: int | list[int] = 1,
     body: str = "Contract body.\n",
 ) -> None:
     metadata: dict[str, Any] = {
@@ -439,3 +439,29 @@ def test_memory_manager_refuses_to_complete_an_existing_partial_task_pair(
     assert result["task"] == 0
     assert result["skipped"] == ["incomplete existing task audit/recipe pair"]
     assert not (task_dir / f"{cell}_recipe.jsonl").exists()
+
+
+def test_evidence_merge_tolerates_list_attempts_and_scalar_seeds(
+    tmp_path: Path,
+) -> None:
+    memory_dir = tmp_path / "memory"
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    manager = MemoryManager(memory_dir)
+    for cell, attempts in (("goal_swap_t1_s0", 2), ("spatial_task_t0_s0", [3])):
+        _write_memory_leaf(
+            memory_dir / "_internal" / "inbox" / cell / "new_global_strategy_x.md",
+            memory_id="shared-lesson",
+            scope="global",
+            cells=[cell],
+            attempts=attempts,
+            body=f"Prose from {cell}.\n",
+        )
+        manager.merge_memory(cell_tag=cell, run_state_dir=output_dir, solved=False)
+
+    published = memory_dir / "global" / "shared-lesson.md"
+    metadata = yaml.safe_load(published.read_text().split("---", 2)[1])
+    assert metadata["evidence"]["attempts"] == 5
+    assert metadata["evidence"]["cells"] == ["goal_swap_t1_s0", "spatial_task_t0_s0"]
+    assert metadata["confidence"] == "probable"
+

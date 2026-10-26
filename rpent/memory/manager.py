@@ -96,20 +96,47 @@ def _render(metadata: dict[str, Any], body: str) -> str:
     )
 
 
+def _attempt_count(value: Any) -> int:
+    """Attempts as an int; drafts sometimes write a list such as ``[3]``."""
+    if isinstance(value, list):
+        return sum(_attempt_count(item) for item in value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _evidence_items(evidence: dict[str, Any], key: str) -> list[Any]:
+    value = evidence.get(key)
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
 def _merge_evidence(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     old_evidence = old.get("evidence") or {}
     new_evidence = new.get("evidence") or {}
-    cells = sorted({*old_evidence.get("cells", []), *new_evidence.get("cells", [])})
+    cells = sorted(
+        {
+            *_evidence_items(old_evidence, "cells"),
+            *_evidence_items(new_evidence, "cells"),
+        },
+        key=str,
+    )
     evidence = {
         **old_evidence,
         "cells": cells,
-        "attempts": int(old_evidence.get("attempts") or 0)
-        + int(new_evidence.get("attempts") or 0),
+        "attempts": _attempt_count(old_evidence.get("attempts"))
+        + _attempt_count(new_evidence.get("attempts")),
     }
     for key in ("solved_seeds", "failed_seeds", "contradicted_by"):
         if key in old_evidence or key in new_evidence:
             evidence[key] = sorted(
-                {*old_evidence.get(key, []), *new_evidence.get(key, [])}
+                {
+                    *_evidence_items(old_evidence, key),
+                    *_evidence_items(new_evidence, key),
+                },
+                key=str,
             )
     tasks = {str(cell).rsplit("_s", 1)[0] for cell in cells}
     confidence = (

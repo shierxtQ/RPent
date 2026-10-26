@@ -29,7 +29,8 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -92,6 +93,25 @@ class _Lease(AbstractContextManager):
         if self._ticket_id is not None:
             self._arbiter._release(self._ticket_id)
             self._ticket_id = None
+
+
+def _owner_is_dead(client_id: str) -> bool:
+    """True when ``client_id`` names a process on this host that has exited.
+
+    Default client ids are ``host:pid:hex``; a killed client never releases
+    its ticket, and its head-of-queue ticket would otherwise block every
+    later client until the stale cutoff.
+    """
+    parts = client_id.split(":")
+    if len(parts) != 3 or parts[0] != socket.gethostname() or not parts[1].isdigit():
+        return False
+    try:
+        os.kill(int(parts[1]), 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
 
 
 class SharedPerceptionArbiter:
@@ -161,8 +181,22 @@ class SharedPerceptionArbiter:
                 raise
         return conn
 
+    @contextmanager
+    def _db(self) -> Iterator[sqlite3.Connection]:
+        """A committed-on-exit connection that is closed right away.
+
+        ``with sqlite3.connect(...)`` only commits; polling at 20 Hz would
+        otherwise leave descriptors open until garbage collection.
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.executescript(_SCHEMA)
 
     def hold(self, resource: str = "perception") -> AbstractContextManager:
@@ -173,7 +207,7 @@ class SharedPerceptionArbiter:
 
     def _insert_ticket(self, resource: str) -> int:
         now = time.time()
-        with self._connect() as conn:
+        with self._db() as conn:
             cur = conn.execute(
                 "INSERT INTO perception_tickets "
                 "(client_id, resource, state, requested_at, heartbeat) "
@@ -184,8 +218,16 @@ class SharedPerceptionArbiter:
 
     def _try_grant(self, ticket_id: int, resource: str) -> bool:
         now = time.time()
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            # A live waiter keeps its ticket fresh, and takes it back (same
+            # queue position) if it was expired while this process was
+            # paused; otherwise a wait longer than stale_s starved it forever.
+            conn.execute(
+                "UPDATE perception_tickets SET state='waiting', heartbeat=?, "
+                "released_at=NULL WHERE id=? AND state IN ('waiting', 'expired')",
+                (now, ticket_id),
+            )
             cutoff = now - self.stale_s
             conn.execute(
                 "UPDATE perception_tickets SET state='expired', released_at=? "
@@ -193,6 +235,17 @@ class SharedPerceptionArbiter:
                 "AND COALESCE(heartbeat, requested_at) < ?",
                 (now, resource, cutoff),
             )
+            for other_id, client_id in conn.execute(
+                "SELECT id, client_id FROM perception_tickets "
+                "WHERE resource=? AND state IN ('active', 'waiting') AND id != ?",
+                (resource, ticket_id),
+            ).fetchall():
+                if _owner_is_dead(client_id):
+                    conn.execute(
+                        "UPDATE perception_tickets SET state='expired', released_at=? "
+                        "WHERE id=?",
+                        (now, other_id),
+                    )
             active = conn.execute(
                 "SELECT id FROM perception_tickets "
                 "WHERE resource=? AND state='active' LIMIT 1",
@@ -236,14 +289,14 @@ class SharedPerceptionArbiter:
         return ticket_id
 
     def _cancel(self, ticket_id: int) -> None:
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 "UPDATE perception_tickets SET state='cancelled', released_at=? WHERE id=?",
                 (time.time(), ticket_id),
             )
 
     def _release(self, ticket_id: int) -> None:
-        with self._connect() as conn:
+        with self._db() as conn:
             conn.execute(
                 "UPDATE perception_tickets SET state='released', released_at=?, heartbeat=? WHERE id=?",
                 (time.time(), time.time(), ticket_id),

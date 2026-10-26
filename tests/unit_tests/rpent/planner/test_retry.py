@@ -18,10 +18,15 @@ import asyncio
 from typing import Any
 
 import pytest
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart
+from pydantic_ai.exceptions import (
+    ModelAPIError,
+    ModelHTTPError,
+    UnexpectedModelBehavior,
+)
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.tools import ToolDefinition
 
 from rpent.planner.retry import RetryingModel, retry_from_env, unwrap_retry
 
@@ -66,6 +71,30 @@ def test_non_retryable_or_exhausted_errors_are_raised(statuses: list[int]) -> No
 
     assert raised.value.status_code == statuses[-1]
     assert calls["n"] == min(len(statuses), 3)
+
+
+def test_failed_streamed_response_with_server_error_is_retried() -> None:
+    # A Responses stream that fails mid-request surfaces as ModelAPIError
+    # (no HTTP status); only server-side codes are worth retrying.
+    errors = [
+        ModelAPIError(
+            "gpt-6-astra", "server_error: Our servers are currently overloaded."
+        ),
+        ModelAPIError("gpt-6-astra", "invalid_request_error: bad input"),
+    ]
+    calls = {"n": 0}
+
+    def function(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        calls["n"] += 1
+        raise errors.pop(0)
+
+    model = RetryingModel(FunctionModel(function), retries=3, base_s=0)
+
+    with pytest.raises(ModelAPIError, match="invalid_request_error"):
+        _request(model)
+    assert calls["n"] == 2
+    assert model.retry_count == 1
 
 
 def test_stream_retries_only_before_the_stream_is_handed_out() -> None:
@@ -127,3 +156,92 @@ def test_retry_backoff_is_excluded_from_active_timeout() -> None:
     assert clock.retry_wait_s() >= 0.45
     assert clock.active_s() < 0.15
     assert ActiveClock(toolkit=object()).retry_wait_s() == 0
+
+
+READ_TOOL = ToolDefinition(
+    name="read_text_file",
+    parameters_json_schema={
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    },
+)
+
+
+@pytest.mark.parametrize("retries, expected_calls", [(3, 3), (1, 2)])
+def test_empty_arguments_for_a_required_tool_are_requested_again(
+    retries: int, expected_calls: int
+) -> None:
+    # Infini's Qwen sometimes returns read_text_file({}) after opening text.
+    replies = [{}, "", {"path": "MEMORY.md"}]
+    calls = {"n": 0}
+
+    def function(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        calls["n"] += 1
+        return ModelResponse(
+            parts=[
+                TextPart("I'll start by reading memory."),
+                ToolCallPart("read_text_file", replies.pop(0)),
+            ]
+        )
+
+    model = RetryingModel(
+        FunctionModel(function), retries=0, base_s=0, empty_args_retries=retries
+    )
+    response = asyncio.run(
+        model.request(
+            MESSAGES, None, ModelRequestParameters(function_tools=[READ_TOOL])
+        )
+    )
+
+    assert calls["n"] == expected_calls
+    assert model.empty_args_retry_count == expected_calls - 1
+    args = response.parts[1].args_as_dict()
+    assert args == ({"path": "MEMORY.md"} if retries == 3 else {})
+
+
+def test_empty_arguments_for_a_tool_without_required_params_are_kept() -> None:
+    calls = {"n": 0}
+
+    def function(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        calls["n"] += 1
+        return ModelResponse(parts=[ToolCallPart("view_env_state", {})])
+
+    view = ToolDefinition(
+        name="view_env_state",
+        parameters_json_schema={"type": "object", "properties": {}},
+    )
+    model = RetryingModel(FunctionModel(function), retries=0, empty_args_retries=3)
+    asyncio.run(
+        model.request(
+            MESSAGES, None, ModelRequestParameters(function_tools=[view, READ_TOOL])
+        )
+    )
+
+    assert calls["n"] == 1
+
+
+def test_malformed_chat_response_is_retried_but_other_model_errors_are_not() -> None:
+    # Infini sometimes returns finish_reason "" which fails schema validation.
+    errors = [
+        UnexpectedModelBehavior(
+            "Invalid response from openai chat completions endpoint: "
+            "1 validation error for ChatCompletion"
+        ),
+        UnexpectedModelBehavior("Received empty model response"),
+    ]
+    calls = {"n": 0}
+
+    def function(messages: list[Any], info: AgentInfo) -> ModelResponse:
+        del messages, info
+        calls["n"] += 1
+        raise errors.pop(0)
+
+    model = RetryingModel(FunctionModel(function), retries=3, base_s=0)
+
+    with pytest.raises(UnexpectedModelBehavior, match="empty model response"):
+        _request(model)
+    assert calls["n"] == 2
+    assert model.retry_count == 1
