@@ -45,6 +45,24 @@ Changed for RoboCasa:
   primitives, task_progress) instead of a LIBERO-PRO arm, takes the task
   language from the episode and the rule as stage 2 froze it, and names the
   episode's termination reason.
+
+Opt-in variants for stage 3 v2 (off by default; with both off every function
+returns what it did before):
+
+- **Scene-free entries** (``scene_free``): the prompt asks for rules that hold
+  in any scene of the task, and :func:`scene_rejections` checks every added or
+  revised entry for scene details (coordinate and pixel lists, pixel positions,
+  step numbers, numbers with two or more decimals, object instance ids, the
+  episode's own task language). A rejected entry is sent back once
+  (:func:`build_fix_prompt`, :func:`merge_rewrites`) and dropped if its rewrite
+  still fails.
+- **Cross-scene verification** (``cross_scene``): an entry becomes verified
+  only when it is applied in a successful episode whose seed differs from the
+  seed of the episode that wrote its current text (``text_seed``); an entry
+  written or revised from a success stays a candidate, and a verified entry's
+  text is frozen (revisions of it are ignored and recorded). Every entry keeps
+  its provenance: ``written_seed``, ``text_seed``, ``text_from``,
+  ``applied_in`` (episode, seed, success) and ``verified_by``.
 """
 
 from __future__ import annotations
@@ -585,6 +603,45 @@ RUN_LOG_NOTE = (
     "results are clipped; robot outcomes come from the recorded states.)\n"
 )
 
+#: The sentence of PROMPT that asks for concrete entries; the scene-free prompt replaces it.
+CONCRETE_RULE = (
+    "Keep entries concrete: the observable situation (what the worker was doing, what the "
+    "state, task_progress or images showed), the root cause, and the exact corrective action "
+    "(tool, numbers, order). "
+)
+SCENE_FREE_RULE = (
+    "The memory is used on other scenes of this task: later episodes run in other kitchen "
+    "layouts, with other object positions and possibly another target object or fixture. Write "
+    "every entry as a rule that holds in any scene of this task: the situation as the worker "
+    "can recognise it (what it was doing, what a tool outcome, task_progress or the images "
+    "showed), the root cause, and the fix as a general procedure (which tools, in which order, "
+    "and which observations decide the next step). Never write world coordinates, pixel "
+    "positions, step or turn numbers, measured values with two or more decimals, object "
+    "instance ids (such as dish0) or this scene's poses, and do not quote this scene's task "
+    'language: write "the task language verbatim" instead. Entries that do are sent back for '
+    "rewriting and dropped if they still do. "
+)
+#: Inserted before PROMPT's length limits when verified entries are frozen (cross-scene verification).
+FROZEN_RULE = (
+    'Entries with status "verified" are frozen: do not revise them (a revision is ignored); '
+    "remove one only if this episode shows it is wrong. "
+)
+LIMITS = "Each field at most two sentences."
+
+
+def prompt_template(*, scene_free: bool = False, frozen_verified: bool = False) -> str:
+    """PROMPT, or its stage-3 v2 variant (scene-free entries, frozen verified entries)."""
+    template = PROMPT
+    if scene_free:
+        if CONCRETE_RULE not in template:  # pragma: no cover - guards edits of PROMPT
+            raise RuntimeError("PROMPT no longer holds the concrete-entry sentence")
+        template = template.replace(CONCRETE_RULE, SCENE_FREE_RULE)
+    if frozen_verified:
+        if template.count(LIMITS) != 1:  # pragma: no cover - guards edits of PROMPT
+            raise RuntimeError("PROMPT no longer holds its length limits once")
+        template = template.replace(LIMITS, FROZEN_RULE + LIMITS)
+    return template
+
 
 def build_prompt(
     d: Mapping[str, Any],
@@ -595,9 +652,20 @@ def build_prompt(
     termination: str,
     entries: Sequence[Mapping[str, Any]],
     settings: Settings = Settings(),
+    scene_free: bool = False,
+    frozen_verified: bool = False,
 ) -> str:
-    """The prompt assembly of run_ecc_stage3.reflect, with the RoboCasa fields."""
-    return PROMPT.format(
+    """The prompt assembly of run_ecc_stage3.reflect, with the RoboCasa fields.
+
+    ``scene_free`` and ``frozen_verified`` select stage 3 v2's instructions
+    (:func:`prompt_template`); both off, the prompt is PROMPT's.
+    """
+    template = (
+        PROMPT
+        if not (scene_free or frozen_verified)
+        else prompt_template(scene_free=scene_free, frozen_verified=frozen_verified)
+    )
+    return template.format(
         language=language or "(see task memory)",
         rule=json.dumps(dict(rule), ensure_ascii=False),
         outcome="SUCCESS" if success else "FAILURE",
@@ -703,8 +771,21 @@ def apply(
     success: bool,
     used: set[str],
     settings: Settings = Settings(),
+    *,
+    seed: int | None = None,
+    cross_scene: bool = False,
 ) -> list[dict[str, Any]]:
-    """The edited memory (run_ecc_stage3.apply, unchanged apart from the settings)."""
+    """The edited memory (run_ecc_stage3.apply, unchanged apart from the settings).
+
+    ``cross_scene`` (stage 3 v2, with the episode's ``seed``): an applied entry
+    becomes verified only in a successful episode on another seed than its
+    ``text_seed``; added and revised entries stay candidates; a verified entry
+    is never revised. The counters and the drop rule are run_ecc_stage3's.
+    """
+    if cross_scene:
+        return _apply_cross_scene(
+            entries, edits, episode, success, used, settings, seed
+        )
     entries = [dict(e) for e in entries]
     # Outcome bookkeeping for entries the senior applied in this episode.
     for e in entries:
@@ -766,6 +847,407 @@ def apply(
     return entries
 
 
+def _cross_scene_verifies(
+    e: Mapping[str, Any], success: bool, seed: int | None
+) -> bool:
+    """Whether applying entry ``e`` in this episode verifies it: a success on another scene."""
+    return (
+        success
+        and seed is not None
+        and e.get("status") != "verified"
+        and e.get("text_seed") is not None
+        and e.get("text_seed") != seed
+    )
+
+
+def frozen_ids(
+    entries: Sequence[Mapping[str, Any]],
+    used: Collection[str],
+    success: bool,
+    seed: int | None,
+) -> set[str]:
+    """Entries whose text a reflection may not revise (cross-scene verification): the verified
+    ones, and the ones this episode verifies."""
+    return {
+        str(e["id"])
+        for e in entries
+        if e.get("status") == "verified"
+        or (str(e["id"]) in used and _cross_scene_verifies(e, success, seed))
+    }
+
+
+def _apply_cross_scene(
+    entries: Sequence[Mapping[str, Any]],
+    edits: Mapping[str, Any],
+    episode: str,
+    success: bool,
+    used: set[str],
+    settings: Settings,
+    seed: int | None,
+) -> list[dict[str, Any]]:
+    """:func:`apply` with cross-scene verification and per-entry provenance."""
+    entries = [dict(e) for e in entries]
+    for e in entries:
+        if e["id"] in used:
+            e["used_in"] = e.get("used_in", []) + [episode]
+            e["applied_in"] = e.get("applied_in", []) + [
+                {"episode": episode, "seed": seed, "success": bool(success)}
+            ]
+            if _cross_scene_verifies(e, success, seed):
+                e["status"] = "verified"
+                e["verified_by"] = {"episode": episode, "seed": seed}
+            if success:
+                e["successes"] = e.get("successes", 0) + 1
+            else:
+                e["failures"] = e.get("failures", 0) + 1
+    remove = set(edits["remove"])
+    revised = {
+        str(r.get("id"))
+        for r in edits["revise"]
+        if str(r.get("id"))
+        not in {x["id"] for x in entries if x.get("status") == "verified"}
+    }
+    entries = [
+        e
+        for e in entries
+        if e["id"] not in remove
+        and (
+            e["id"] in revised
+            or not (
+                e.get("failures", 0) >= settings.fails_to_drop
+                and not e.get("successes")
+            )
+        )
+    ]
+    by_id = {e["id"]: e for e in entries}
+    for r in edits["revise"]:
+        e = by_id.get(str(r.get("id")))
+        if e is None or e.get("status") == "verified":
+            continue  # a verified entry's text is the one that was verified
+        for k in ENTRY_FIELDS:
+            if r.get(k):
+                e[k] = str(r[k])[: settings.field_chars]
+        e["revised_in"] = e.get("revised_in", []) + [episode]
+        e["failures"] = 0  # the revised fix has not failed yet
+        e["text_seed"] = seed
+        e["text_from"] = episode
+    stem, next_id = episode.rsplit("/", 1)[-1], 1
+    for a in edits["add"]:
+        if len(entries) >= settings.max_entries:
+            break
+        if not all(a.get(k) for k in ENTRY_FIELDS):
+            continue
+        entries.append(
+            {
+                "id": f"{stem}.{next_id}",
+                "trigger": str(a.get("trigger") or "any"),
+                **{k: str(a[k])[: settings.field_chars] for k in ENTRY_FIELDS},
+                "status": "candidate",
+                "written_in": episode,
+                "used_in": [],
+                "successes": 0,
+                "failures": 0,
+                "written_seed": seed,
+                "text_seed": seed,
+                "text_from": episode,
+                "applied_in": [],
+                "verified_by": None,
+            }
+        )
+        next_id += 1
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# scene-free entries (stage 3 v2): the check, the rewrite request, the merge
+# ---------------------------------------------------------------------------
+
+#: (rule, pattern): text that ties an entry to one scene or episode. Each rule's name is what
+#: the rewrite request tells GPT-6.
+SCENE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "a list of coordinates or pixels",
+        re.compile(
+            r"[\[(]\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?(?:\s*,\s*-?\d+(?:\.\d+)?)*\s*[\])]"
+        ),
+    ),
+    (
+        "a pixel position",
+        re.compile(r"\b(?:rows?|columns?|cols?|pixels?|px)\s*[=:~≈]?\s*-?\d+", re.I),
+    ),
+    (
+        "a step, turn or seed number of this episode",
+        re.compile(
+            r"\bstep\s*[-=:#]?\s*\d+|\bsteps\s+\d+|\"step\"\s*:\s*\d+|\bseeds?\s*[-=:#]?\s*\d+|"
+            r"\b(?:at|on|by|from|until|after|before|in)\s+(?:turn|request)\s+\d+\b",
+            re.I,
+        ),
+    ),
+    (
+        "a measured value (a number with two or more decimals)",
+        re.compile(r"(?<![\w.])-?\d+\.\d{2,}(?!\d|\.\d)"),
+    ),
+    (
+        "an object instance id",
+        re.compile(r"\b(?:[a-z]+_)*[a-z]{2,}_?\d+\b", re.I),
+    ),
+)
+#: Quoted text (straight or typographic quotes): a quoted part of the task language counts too.
+QUOTED = re.compile(
+    r'"([^"]+)"|\'([^\']+)\'|\u201c([^\u201d]+)\u201d|\u2018([^\u2019]+)\u2019'
+)
+#: Model and robot names the instance-id pattern would otherwise match.
+NOT_INSTANCE_IDS = frozenset({"gpt6", "qwen3", "rldx1", "rc365", "rgb8"})
+#: The episode's task language counts as quoted from this many words on.
+LANGUAGE_MIN_WORDS = 3
+MATCH_CHARS = 80
+
+
+def _language_key(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().rstrip(".!?").strip().lower()
+
+
+def scene_problems(
+    text: str, *, language: str = "", allowed: Collection[str] = ()
+) -> list[tuple[str, str]]:
+    """``(rule, matched text)`` for every scene detail in ``text``; empty when it is scene-free.
+
+    ``allowed`` lists literal numbers that are task-level constants (exempt
+    from the decimals rule); ``language`` is the episode's task language,
+    which an entry may not contain, nor quote a part of (three words or more).
+    """
+    found: list[tuple[str, str]] = []
+    for name, pattern in SCENE_RULES:
+        for match in pattern.finditer(text or ""):
+            value = match.group(0)
+            if name.startswith("a measured value") and value.lstrip("-") in {
+                a.lstrip("-") for a in allowed
+            }:
+                continue
+            if name == "an object instance id" and value.lower() in NOT_INSTANCE_IDS:
+                continue
+            found.append((name, value[:MATCH_CHARS]))
+    key = _language_key(language)
+    if len(key.split()) >= LANGUAGE_MIN_WORDS:
+        if key in _language_key(text):
+            found.append(("this scene's task language", key[:MATCH_CHARS]))
+        else:
+            for match in QUOTED.finditer(text or ""):
+                span = _language_key(next(g for g in match.groups() if g))
+                if len(span.split()) >= LANGUAGE_MIN_WORDS and span in key:
+                    found.append(("this scene's task language", span[:MATCH_CHARS]))
+                    break
+    return found
+
+
+def used_ids(
+    entries: Sequence[Mapping[str, Any]],
+    edits: Mapping[str, Any],
+    shown: Collection[str] | None = None,
+) -> set[str]:
+    """The ids ``reviewed`` counts as used: listed in ``applied``, existing, and shown."""
+    listed = {str(i) for i in edits["applied"]} & {e["id"] for e in entries}
+    return listed if shown is None else listed & set(shown)
+
+
+def scene_rejections(
+    edits: Mapping[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    language: str = "",
+    allowed: Collection[str] = (),
+    frozen: Collection[str] = (),
+    chars: int | None = None,
+) -> list[dict[str, Any]]:
+    """The added and revised entries of ``edits`` that are not scene-free, one row per item.
+
+    Only items ``apply`` would act on are checked: adds with all three fields
+    (their trigger too, which ``apply`` stores as written), and revisions of
+    existing entries that are not frozen. ``chars`` (``Settings.field_chars``)
+    also checks each field as ``apply`` stores it, cut to that length. ``item``
+    names the item for the rewrite request: ``add <n>`` (1-based position in
+    ``add``) or ``revise <id>``.
+    """
+    rows = []
+    for n, a in enumerate(edits["add"], 1):
+        if not all(a.get(k) for k in ENTRY_FIELDS):
+            continue
+        problems = item_problems(a, language, allowed, add=True, chars=chars)
+        if problems:
+            rows.append(
+                {"item": f"add {n}", "kind": "add", "n": n, "problems": problems}
+            )
+    known = {str(e["id"]) for e in entries}
+    for r in edits["revise"]:
+        rid = str(r.get("id"))
+        if rid not in known or rid in frozen:
+            continue
+        problems = item_problems(r, language, allowed, chars=chars)
+        if problems:
+            rows.append(
+                {
+                    "item": f"revise {rid}",
+                    "kind": "revise",
+                    "id": rid,
+                    "problems": problems,
+                }
+            )
+    return rows
+
+
+def item_problems(
+    item: Mapping[str, Any],
+    language: str,
+    allowed: Collection[str],
+    *,
+    add: bool = False,
+    chars: int | None = None,
+) -> list[dict[str, str]]:
+    """The scene problems of one entry or edit item, per field: ``situation``, ``diagnosis``
+    and ``fix`` (an add's or a new entry's ``trigger`` too), each as written and, with
+    ``chars``, as stored (cut to ``chars``), so a cut can never make a stored field fail."""
+    out: list[dict[str, str]] = []
+    for k in (("trigger",) if add else ()) + ENTRY_FIELDS:
+        if not item.get(k):
+            continue
+        text = str(item[k])
+        variants = [text]
+        if chars and k in ENTRY_FIELDS and len(text) > chars:
+            variants.append(text[:chars])
+        seen: set[tuple[str, str]] = set()
+        for variant in variants:
+            for rule, match in scene_problems(
+                variant, language=language, allowed=allowed
+            ):
+                if (rule, match) not in seen:
+                    seen.add((rule, match))
+                    out.append({"field": k, "rule": rule, "match": match})
+    return out
+
+
+FIX_PROMPT = """{prompt}
+
+Your reply was:
+{reply}
+
+These entries of your reply are tied to this one scene, so they cannot be kept as they are:
+{problems}
+Rewrite each of them as a rule that holds in any scene of this task. Keep the lesson; describe \
+positions, amounts and targets by what the worker can observe or compute in the current scene \
+(for example "the handle's centre in the current image"), and write "the task language verbatim" \
+instead of quoting the task. An entry that cannot be written without scene details is dropped.
+
+Reply with JSON only, one item per entry listed above (leave an entry out to drop it):
+{{"add": [{{"n": 1, "trigger": "plan|checkin|errors|stall|giveup|any", "situation": "...", "diagnosis": "...", "fix": "..."}}],
+ "revise": [{{"id": "...", "situation": "...", "diagnosis": "...", "fix": "..."}}]}}"""
+
+
+def build_fix_prompt(
+    prompt: str, reply: str, rejections: Sequence[Mapping[str, Any]]
+) -> str:
+    """The rewrite request: the reflection prompt, GPT-6's reply and why each listed item fails."""
+    lines = []
+    for row in rejections:
+        why = "; ".join(
+            f'{p["field"]} has {p["rule"]} ("{p["match"]}")' for p in row["problems"]
+        )
+        lines.append(f"- {row['item']}: {why}")
+    return FIX_PROMPT.format(
+        prompt=prompt, reply=reply.strip(), problems="\n".join(lines)
+    )
+
+
+def parse_rewrites(text: str) -> dict[str, Any]:
+    """The rewritten items of a rewrite reply: ``{"add": {n: item}, "revise": {id: item}}``."""
+    out: dict[str, Any] = {"add": {}, "revise": {}}
+    match = re.search(r"\{.*\}", text or "", re.S)
+    if not match:
+        return out
+    try:
+        doc = json.loads(match.group(0))
+    except ValueError:
+        return out
+    if not isinstance(doc, dict):
+        return out
+    adds = doc.get("add") or []
+    for item in adds if isinstance(adds, list) else []:
+        if isinstance(item, dict) and str(item.get("n", "")).strip().isdigit():
+            out["add"].setdefault(int(str(item["n"]).strip()), item)
+    revs = doc.get("revise") or []
+    for item in revs if isinstance(revs, list) else []:
+        if isinstance(item, dict) and item.get("id") is not None:
+            out["revise"].setdefault(str(item["id"]), item)
+    return out
+
+
+def merge_rewrites(
+    edits: Mapping[str, Any],
+    rejections: Sequence[Mapping[str, Any]],
+    rewrites: Mapping[str, Any] | None,
+    *,
+    language: str = "",
+    allowed: Collection[str] = (),
+    chars: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``edits`` with every rejected item replaced by its rewrite when that is scene-free, else
+    dropped; ``rewrites`` None (a refused rewrite request) drops them all.
+
+    A rewritten item takes the rewrite's fields and the original's where the
+    rewrite leaves one out (so an original field that failed fails again), and
+    keeps its place; it is checked as :func:`scene_rejections` checks (``chars``
+    as there). Returns the merged edits and the outcome: ``kept`` and
+    ``dropped`` items, and ``still_rejected`` (the problems of each rewrite
+    that failed again).
+    """
+    rewrites = rewrites or {"add": {}, "revise": {}}
+    rejected = {row["item"]: row for row in rejections}
+    kept, dropped, still = [], [], []
+    adds = []
+    for n, a in enumerate(edits["add"], 1):
+        row = rejected.get(f"add {n}")
+        if row is None:
+            adds.append(a)
+            continue
+        new = rewrites["add"].get(n)
+        if new is None:
+            dropped.append(row["item"])
+            continue
+        merged = {
+            "trigger": str(new.get("trigger") or a.get("trigger") or "any"),
+            **{k: new.get(k) or a.get(k) for k in ENTRY_FIELDS},
+        }
+        problems = item_problems(merged, language, allowed, add=True, chars=chars)
+        if problems or not all(merged.get(k) for k in ENTRY_FIELDS):
+            dropped.append(row["item"])
+            still.append({"item": row["item"], "problems": problems})
+            continue
+        adds.append(merged)
+        kept.append(row["item"])
+    revises = []
+    for r in edits["revise"]:
+        row = rejected.get(f"revise {r.get('id')}")
+        if row is None:
+            revises.append(r)
+            continue
+        new = rewrites["revise"].get(str(r.get("id")))
+        if new is None:
+            dropped.append(row["item"])
+            continue
+        merged = {"id": str(r.get("id"))}
+        for k in ENTRY_FIELDS:
+            if new.get(k) or r.get(k):
+                merged[k] = new.get(k) or r.get(k)
+        problems = item_problems(merged, language, allowed, chars=chars)
+        if problems or len(merged) == 1:
+            dropped.append(row["item"])
+            still.append({"item": row["item"], "problems": problems})
+            continue
+        revises.append(merged)
+        kept.append(row["item"])
+    merged_edits = {**edits, "add": adds, "revise": revises}
+    return merged_edits, {"kept": kept, "dropped": dropped, "still_rejected": still}
+
+
 def decide(d: Mapping[str, Any]) -> str | None:
     """Why an episode is not reflected on (run_ecc_stage3.reflect), or None to reflect."""
     if d["interventions"] == 0:
@@ -782,6 +1264,10 @@ def reviewed(
     success: bool,
     settings: Settings = Settings(),
     shown: Collection[str] | None = None,
+    *,
+    seed: int | None = None,
+    cross_scene: bool = False,
+    edits: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Edits, used ids and the memory after one reply (run_ecc_stage3.reflect after the call).
 
@@ -790,16 +1276,38 @@ def reviewed(
     counts as used only if the episode was shown it, and the others are
     returned as ``applied_not_shown``. Without it, as run_ecc_stage3, where the
     two memories are the same.
+
+    Stage 3 v2: ``edits`` are already parsed (and checked) edits to use instead
+    of parsing ``reply``; ``cross_scene`` applies them with cross-scene
+    verification on the episode's ``seed`` and also returns
+    ``revise_ignored_verified`` (revisions of frozen entries) and
+    ``verified_now`` (entries this episode verified).
     """
-    try:
-        edits = parse_edits(reply)
+    if edits is None:
+        try:
+            edits = parse_edits(reply)
+            status = "applied"
+        except ValueError as exc:
+            edits = dict(NO_EDITS, note=f"unparsed reply: {exc}")
+            status = "unparsed"
+    else:
         status = "applied"
-    except ValueError as exc:
-        edits = dict(NO_EDITS, note=f"unparsed reply: {exc}")
-        status = "unparsed"
     listed = {str(i) for i in edits["applied"]} & {e["id"] for e in entries}
-    used = listed if shown is None else listed & set(shown)
-    after = apply(entries, edits, episode, success, used, settings)
+    used = used_ids(entries, edits, shown)
+    ignored = []
+    if cross_scene:
+        frozen = frozen_ids(entries, used, success, seed)
+        ignored = sorted({str(r.get("id")) for r in edits["revise"]} & frozen)
+    after = apply(
+        entries,
+        edits,
+        episode,
+        success,
+        used,
+        settings,
+        seed=seed,
+        cross_scene=cross_scene,
+    )
     out = {
         "status": status,
         "edits": edits,
@@ -808,4 +1316,11 @@ def reviewed(
     }
     if shown is not None:
         out["applied_not_shown"] = sorted(listed - used)
+    if cross_scene:
+        out["revise_ignored_verified"] = ignored
+        out["verified_now"] = sorted(
+            str(e["id"])
+            for e in after
+            if (e.get("verified_by") or {}).get("episode") == episode
+        )
     return out
