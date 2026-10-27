@@ -144,6 +144,13 @@ fails_to_drop = 2
 context_before = 3
 context_after = 6
 # launcher = ["bash", "{code_dir}/scripts/ecc_robocasa/hybrid_cell.sh"]
+# Stage 3 v2 (README "Stage 3 v2"; all off by default):
+# session_seeds = [12, 13, 14, 15, 16]        # one seed per session; the first = seed; never 0-11
+# scene_free = true                           # scene-independent entries: checked, one rewrite request, else dropped
+# scene_free_allowed_numbers = []             # task-level constants exempt from the decimals rule, e.g. ["0.95"]
+# cross_scene_verify = true                   # verified only when applied in a success on another seed
+# stop_rule = "cross_scene"                   # stop after a verified session, unneeded_sessions GPT-6-free sessions, or the budget
+# unneeded_sessions = 2
 
 [stage3.timeout_s_by_split]                   # planner time per episode (default: the Target50 protocol)
 atomic = 1800

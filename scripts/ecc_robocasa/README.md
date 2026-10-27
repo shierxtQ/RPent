@@ -353,6 +353,34 @@ $PY $S reflect-only EPISODE_DIR                  # the digest and prompt of one 
 The product is `product/final/<Task>.md` (verified entries only, rendered as `run_ecc_stage3.render`;
 empty when there are none) and `<Task>.json`, with `PRODUCT.json` (schema `rc-ecc-s3-product/1`).
 
+## Stage 3 v2: scene-free entries verified on another scene
+
+Opt-in switches (all off by default; off, a run is the stage 3 above, with the same experiment hash and the
+same files). They test one hypothesis: a correction note helps on new scenes only if it is written for any
+scene of the task and has been shown to help on a scene other than the one it was written on.
+
+| Switch (`[stage3]`) | Default | What it changes |
+|---|---|---|
+| `session_seeds` | `[]` | One seed per session (e.g. `[12, 13, 14, 15, 16]`); a session's attempts share it. The first must be `stage3.seed`; Target50 cells (0-10), stage 1's and stage 2's seeds are refused |
+| `scene_free` | `false` | The reflection asks for rules that hold in any scene; every added or revised entry is checked (`reflect.SCENE_RULES`: coordinate or pixel lists, pixel positions, step/turn/seed numbers, numbers with 2+ decimals, object instance ids, the episode's task language); a reply with rejected items gets one rewrite request (`fix_prompt.txt`, `fix_request.json`, a second call of the same reflection with its own `max_calls`); a rewrite that still fails, is missing or refused drops the item. Every rejection and its outcome is in `reflection.json` (`scene_free`) |
+| `scene_free_allowed_numbers` | `[]` | Task-level constants (strings, e.g. `"0.95"`) exempt from the decimals rule |
+| `cross_scene_verify` | `false` | An entry becomes verified only when GPT-6 lists it in `applied` in a successful episode whose seed differs from `text_seed` (the seed of the episode that wrote or last revised it); written or revised from a success it stays a candidate; a verified entry's text is frozen (revisions ignored, removal allowed). Entries carry `written_seed`, `text_seed`, `text_from`, `applied_in` (episode, seed, success) and `verified_by`. Needs `session_seeds` |
+| `stop_rule` | `"first_success"` | `"cross_scene"`: a task stops after the session that leaves a verified entry (`verified`), after `unneeded_sessions` sessions in a row whose every valid episode succeeded without a GPT-6 turn (`no_correction_needed`), or after the last session (`budget`); `record.json` names the reason (`stop_reason`, also `infra_exhausted`). Needs `cross_scene_verify` |
+| `unneeded_sessions` | `2` | See `stop_rule` |
+
+The drop rule, the 8-entry cap, the digest, skips, refusals, the S2 rule per task, the read-only S1 memory
+and the corrections file are unchanged. `freeze` also checks that every episode ran on its session's seed,
+that every entry verified in a reflection was in that episode's corrections file as it stood and applied in
+that successful episode on another seed, and that every field a reflection added or changed (an added
+entry's trigger too) passes the scene check against that episode's task language, as the runner checked it;
+`verify` checks each kept entry's provenance and that `<Task>.md` renders `<Task>.json`'s entries. The final
+test reads `<Task>.md` as before.
+`stage3.py reflect-only EPISODE_DIR --config CONFIG` prints the prompt of the config's mode (no call).
+
+Tests: `test_stage3_v2_reflect.py`, `test_stage3_v2_runner.py`; with `ECC_RC_OLD_CODE` set to a checkout
+of the code before these switches, `test_stage3_v2_equivalence.py` runs the same fake stage-3 runs with both
+and requires the same files.
+
 # The final test (`final_test.py`)
 
 `final_test.py` runs named arms (`[final_test.arms.<name>]`: planner hybrid, qwen or gpt6, memory s1 /
