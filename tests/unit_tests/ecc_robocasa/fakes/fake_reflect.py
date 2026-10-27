@@ -19,6 +19,11 @@ comes from ``ECC_RC_FAKE_REFLECT`` (JSON): ``{"<Task>/<episode>": spec |
 [spec per call], "default": spec}`` with ``status`` (``ok`` | ``refused`` |
 ``error`` | ``empty`` | ``crash``: no reply), ``edits`` (the JSON reply; default:
 apply every shown entry and add one), ``text`` (a raw reply) and ``sleep_s``.
+
+A rewrite request of stage 3 v2 (``"kind": "fix"`` in the request) is answered
+from the spec's ``fix`` (a spec, or a list of specs per rewrite call) with
+``status``, ``rewrites`` (the JSON reply) or ``text``, and ``sleep_s``; by
+default every listed item comes back as a scene-free rewrite.
 Every call is logged to ``ECC_RC_FAKE_LOG`` with the request and what the prompt held.
 """
 
@@ -42,7 +47,15 @@ def main() -> int:
     scenario = json.loads(Path(os.environ["ECC_RC_FAKE_REFLECT"]).read_text())
     spec = scenario.get(episode, scenario.get("default", {}))
     specs = spec if isinstance(spec, list) else [spec]
-    spec = specs[min(call, len(specs)) - 1]
+    kind = request.get("kind", "main")
+    if kind == "fix":
+        # the rewrite calls of the main call that succeeded (the last spec with status ok)
+        main = next((x for x in reversed(specs) if x.get("status", "ok") == "ok"), {})
+        fixes = main.get("fix", {})
+        fixes = fixes if isinstance(fixes, list) else [fixes]
+        spec = fixes[min(int(request["attempt"]), len(fixes)) - 1]
+    else:
+        spec = specs[min(call, len(specs)) - 1]
     entries = json.loads(
         prompt.split("Current correction memory (JSON):\n", 1)[1].split(
             "\n\nEdit the memory", 1
@@ -56,6 +69,7 @@ def main() -> int:
                         "event": "reflect",
                         "episode": episode,
                         "call": call,
+                        "kind": kind,
                         "pid": os.getpid(),
                         "t": time.time(),
                         "model": request["model"],
@@ -80,6 +94,9 @@ def main() -> int:
     status = spec.get("status", "ok")
     if status == "crash":
         return 3
+    if kind == "fix":
+        reply = spec.get("rewrites") or default_rewrites(prompt)
+        return write(reply_path, request, status, spec.get("text", json.dumps(reply)))
     edits = spec.get("edits") or {
         "applied": [e["id"] for e in entries],
         "add": [
@@ -94,12 +111,38 @@ def main() -> int:
         "remove": [],
         "note": f"lesson of {episode}",
     }
+    return write(reply_path, request, status, spec.get("text", json.dumps(edits)))
+
+
+def default_rewrites(prompt: str) -> dict:
+    """A scene-free rewrite of every item the rewrite request lists (``- add 2: ...``)."""
+    listed = prompt.split("cannot be kept as they are:\n", 1)[1].split(
+        "\nRewrite each", 1
+    )[0]
+    out: dict = {"add": [], "revise": []}
+    for line in listed.splitlines():
+        match = re.match(r"- (add (\d+)|revise (\S+)):", line)
+        if not match:
+            continue
+        item = {
+            "situation": "the worker repeated a capped skill call",
+            "diagnosis": "the skill made no progress from this pose",
+            "fix": "re-localize the target in the current image, then retry the skill once",
+        }
+        if match.group(2):
+            out["add"].append({"n": int(match.group(2)), "trigger": "checkin", **item})
+        else:
+            out["revise"].append({"id": match.group(3), **item})
+    return out
+
+
+def write(reply_path: Path, request: dict, status: str, text: str) -> int:
     record = {
         "model": request["model"],
         "reasoning_effort": request["reasoning_effort"],
         "prompt_sha256": request["prompt_sha256"],
         "status": status,
-        "text": spec.get("text", json.dumps(edits)) if status == "ok" else "",
+        "text": text if status == "ok" else "",
         "usage": {
             "input_tokens": 4000,
             "cached_input_tokens": 1000,

@@ -53,13 +53,36 @@ When every task is final, the product is frozen: ``product/final/<Task>.md``
 (verified entries only, rendered as run_ecc_stage3 does; empty when none) for every task,
 with a hashed manifest. Dry run by default (prints the plan); ``run --go``
 launches. See README.md.
+
+Stage 3 v2 (every switch off by default; off, the run is the stage 3 above):
+
+- ``session_seeds``: session k runs on its own seed (all attempts of a session
+  share it), e.g. ``[12, 13, 14, 15, 16]``; never a Target50 cell or another
+  stage's seed.
+- ``scene_free``: the reflection asks for scene-independent entries; every
+  added or revised entry is checked for scene details (``reflect.SCENE_RULES``),
+  a rejected one is sent back to GPT-6 once with the reason (a second call of
+  the same reflection) and dropped if its rewrite fails again; every rejection
+  is recorded in ``reflection.json`` (``scene_free``).
+- ``cross_scene_verify``: an entry becomes verified only when it is applied
+  in a successful episode on another seed than the one its text was written
+  on; written or revised from a success, it stays a candidate; a verified
+  entry's text is frozen. Each entry records ``written_seed``, ``text_seed``,
+  ``applied_in`` (with seeds) and ``verified_by``.
+- ``stop_rule = "cross_scene"``: a task stops after the session that leaves a
+  verified entry (``verified``), after ``unneeded_sessions`` (2) sessions in a
+  row whose every valid episode succeeded without a GPT-6 turn
+  (``no_correction_needed``), or after the last session (``budget``); a
+  success alone no longer stops it. The record names the reason.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -142,6 +165,26 @@ REFLECTION_EXPERIMENT_KEYS = (
     "max_output_tokens",
     "empty_retries",
 )
+#: Stage 3 v2's switches and their defaults (the stage 3 above). They are read with these
+#: defaults instead of being merged into the config, so a config without them loads, hashes
+#: and snapshots exactly as before; each one is part of the experiment only when it differs.
+V2_DEFAULTS: dict[str, Any] = {
+    "session_seeds": [],  # []: every session on stage3.seed; else one seed per session
+    "scene_free": False,  # scene-independent entries: prompt, check, one rewrite request
+    "scene_free_allowed_numbers": [],  # task-level constants exempt from the decimals rule
+    "cross_scene_verify": False,  # verified only by a success on another seed than the text's
+    "stop_rule": "first_success",  # or "cross_scene"
+    "unneeded_sessions": 2,  # cross_scene stop: all-success sessions in a row without GPT-6
+}
+STOP_RULES = ("first_success", "cross_scene")
+#: Why a task stopped under stop_rule "cross_scene" (record.json ``stop_reason``).
+STOP_REASONS = ("verified", "no_correction_needed", "budget", "infra_exhausted")
+
+
+def v2_settings(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """The stage-3 v2 switches of ``cfg`` with their defaults filled in."""
+    s3 = cfg["stage3"]
+    return {k: copy.deepcopy(s3.get(k, d)) for k, d in V2_DEFAULTS.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +246,64 @@ def validate(cfg: Mapping[str, Any]) -> None:
             raise ValueError(
                 f"stage3.timeout_s_by_split: bad entry {split} = {value!r}"
             )
+    validate_v2(cfg, s2_seed)
+
+
+def validate_v2(cfg: Mapping[str, Any], s2_seed: int) -> None:
+    """The stage-3 v2 switches: types, the session seeds and the switches they need."""
+    s3, v2 = cfg["stage3"], v2_settings(cfg)
+    seeds = v2["session_seeds"]
+    if not isinstance(seeds, list) or any(
+        not isinstance(x, int) or isinstance(x, bool) or x < 0 for x in seeds
+    ):
+        raise ValueError("stage3.session_seeds must be a list of nonnegative integers")
+    if seeds:
+        if len(seeds) != s3["sessions"]:
+            raise ValueError(
+                f"stage3.session_seeds has {len(seeds)} seeds for {s3['sessions']} sessions"
+            )
+        if len(set(seeds)) != len(seeds):
+            raise ValueError(
+                "stage3.session_seeds must be distinct (one scene per session)"
+            )
+        if seeds[0] != s3["seed"]:
+            raise ValueError(
+                f"stage3.session_seeds[0] ({seeds[0]}) must equal stage3.seed ({s3['seed']})"
+            )
+        s1_seed = int((cfg.get("stage1") or {}).get("seed", 0))
+        bad = sorted(set(seeds) & (RESERVED_SEEDS | {s1_seed, s2_seed}))
+        if bad:
+            raise ValueError(
+                f"stage3.session_seeds {bad}: Target50 cells (atomic 1-10, composite 1-5), stage 1's "
+                f"seed ({s1_seed}) and stage 2's seed ({s2_seed}) are never stage-3 scenes"
+            )
+    for key in ("scene_free", "cross_scene_verify"):
+        if not isinstance(v2[key], bool):
+            raise ValueError(f"stage3.{key} must be true or false")
+    allowed = v2["scene_free_allowed_numbers"]
+    if not isinstance(allowed, list) or any(
+        not isinstance(x, str) or not re.fullmatch(r"-?\d+(?:\.\d+)?", x)
+        for x in allowed
+    ):
+        raise ValueError(
+            'stage3.scene_free_allowed_numbers must be a list of numbers as strings, e.g. ["0.95"]'
+        )
+    if v2["cross_scene_verify"] and len(set(seeds)) < 2:
+        raise ValueError(
+            "stage3.cross_scene_verify needs stage3.session_seeds (one seed per session): on one "
+            "scene no entry could be verified on another"
+        )
+    if v2["stop_rule"] not in STOP_RULES:
+        raise ValueError(f"stage3.stop_rule must be one of {list(STOP_RULES)}")
+    if v2["stop_rule"] == "cross_scene" and not v2["cross_scene_verify"]:
+        raise ValueError(
+            'stage3.stop_rule = "cross_scene" needs stage3.cross_scene_verify'
+        )
+    n = v2["unneeded_sessions"]
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= s3["sessions"]:
+        raise ValueError(
+            "stage3.unneeded_sessions must be an integer from 1 to stage3.sessions"
+        )
 
 
 def budget(cfg: Mapping[str, Any]) -> int:
@@ -227,13 +328,15 @@ def reflection_model(cfg: Mapping[str, Any]) -> tuple[str, str]:
 def experiment_settings(cfg: Mapping[str, Any]) -> dict[str, Any]:
     """The ``[stage3]`` values that define the experiment.
 
-    ``parallel_attempts`` is listed only when on, so a sequential run's
-    settings and hash are what they were before the switch existed.
+    ``parallel_attempts`` is listed only when on, and stage 3 v2's switches
+    only when they differ from their defaults, so a run without them has the
+    settings and hash it had before the switches existed.
     """
     s3 = cfg["stage3"]
     out = {k: s3[k] for k in EXPERIMENT_KEYS}
     if s3["parallel_attempts"]:
         out["parallel_attempts"] = True
+    out.update({k: v for k, v in v2_settings(cfg).items() if v != V2_DEFAULTS[k]})
     return out
 
 
@@ -407,6 +510,15 @@ class Stage3(C.Stage):
         self.attempts = int(cfg["stage3"]["attempts_per_session"])
         self.sessions = int(cfg["stage3"]["sessions"])
         self.parallel = bool(cfg["stage3"]["parallel_attempts"])
+        v2 = v2_settings(cfg)
+        self.session_seeds = [int(x) for x in v2["session_seeds"]]
+        self.scene_free = bool(v2["scene_free"])
+        self.allowed_numbers = [str(x) for x in v2["scene_free_allowed_numbers"]]
+        self.cross_scene = bool(v2["cross_scene_verify"])
+        self.stop_rule = str(v2["stop_rule"])
+        self.unneeded_sessions = int(v2["unneeded_sessions"])
+        #: Any stage-3 v2 switch on (the records then carry the v2 fields).
+        self.v2 = any(v != V2_DEFAULTS[k] for k, v in v2.items())
         self.settings = settings(cfg)
         self.refl = cfg["stage3"]["reflection"]
         self.code_dir = Path(cfg["paths"].get("code_dir") or REPO_ROOT)
@@ -416,7 +528,7 @@ class Stage3(C.Stage):
                 job_id=job_id(task, R.episode_name(e, self.attempts)),
                 task=task,
                 split=split,
-                seed=self.seed,
+                seed=self.seed_of(e),
                 order=i * 100 + e,
                 meta={"episode": e, "name": R.episode_name(e, self.attempts)},
             )
@@ -468,6 +580,12 @@ class Stage3(C.Stage):
 
     def session_episodes(self, s: int) -> range:
         return range(s * self.attempts, (s + 1) * self.attempts)
+
+    def seed_of(self, e: int) -> int:
+        """The scene of episode ``e``: its session's seed (``session_seeds``), else stage3.seed."""
+        return (
+            self.session_seeds[self.session_of(e)] if self.session_seeds else self.seed
+        )
 
     def session_started(
         self, task: str, e: int, states: Mapping[str, Mapping[str, Any]]
@@ -542,7 +660,7 @@ class Stage3(C.Stage):
                     "split": job.split,
                     "episode": self.name_of(e),
                     "index": e,
-                    "seed": self.seed,
+                    "seed": self.seed_of(e),
                     "rule": self.rules[task].as_json(),
                     "rung": rung_of(self.rules[task]),
                     "corrections": {"path": str(path), **info},
@@ -628,6 +746,8 @@ class Stage3(C.Stage):
         e = job.meta["episode"]
         if self.record_path(job.task).exists():
             return False
+        if self.stop_rule != "first_success":
+            return self._ready_v2(job.task, e, states)
         if self.parallel:
             s = self.session_of(e)
             previous = self.session_episodes(s - 1) if s else range(0)
@@ -641,6 +761,77 @@ class Stage3(C.Stage):
                 return False
         return True
 
+    def _ready_v2(
+        self, task: str, e: int, states: Mapping[str, Mapping[str, Any]]
+    ) -> bool:
+        """:meth:`ready` under stop_rule "cross_scene": the previous episode (parallel: the
+        previous session) is valid and reflected on, success or not, and a session boundary
+        is crossed only when the stop rule let the task go on."""
+        s = self.session_of(e)
+        if self.parallel:
+            previous = list(self.session_episodes(s - 1)) if s else []
+        else:
+            previous = [e - 1] if e else []
+        for p in previous:
+            final = states[job_id(task, self.name_of(p))].get("final")
+            if not final or final.get("class") != "valid":
+                return False
+            if not self.reflection_path(task, p).exists():
+                return False
+        if previous and self.session_of(previous[-1]) != s:
+            return self.stop_after(task, s - 1, states) is None
+        return True
+
+    def stop_after(
+        self, task: str, s: int, states: Mapping[str, Mapping[str, Any]]
+    ) -> str | None:
+        """Why the task stops after session ``s`` (stop_rule "cross_scene"), or None to go on.
+
+        Read once every episode of the session is valid and reflected on:
+        ``verified`` when the memory after the session holds a verified entry;
+        ``no_correction_needed`` when this and the previous sessions
+        (``unneeded_sessions`` in a row) had every valid episode succeed
+        without a GPT-6 turn; ``budget`` after the last session.
+        """
+        records = []
+        for p in self.session_episodes(s):
+            final = states[job_id(task, self.name_of(p))].get("final") or {}
+            record = C.read_json(self.reflection_path(task, p))
+            if final.get("class") != "valid" or not isinstance(record, dict):
+                return None
+            records.append(record)
+        if any(x.get("status") == "verified" for x in records[-1]["entries_after"]):
+            return "verified"
+        first = s - self.unneeded_sessions + 1
+        if first >= 0 and all(
+            self.needed_no_senior(task, q, states) for q in range(first, s + 1)
+        ):
+            return "no_correction_needed"
+        if s == self.sessions - 1:
+            return "budget"
+        return None
+
+    def needed_no_senior(
+        self, task: str, s: int, states: Mapping[str, Mapping[str, Any]]
+    ) -> bool:
+        """Whether every valid episode of session ``s`` succeeded without a GPT-6 turn."""
+        for p in self.session_episodes(s):
+            final = states[job_id(task, self.name_of(p))].get("final") or {}
+            record = C.read_json(self.reflection_path(task, p)) or {}
+            if final.get("class") != "valid" or not final.get("success"):
+                return False
+            if int(record.get("interventions") or 0) > 0:
+                return False
+        return True
+
+    def solved_status(self, task: str, states: Mapping[str, Mapping[str, Any]]) -> str:
+        """``solved`` when any valid episode of the task succeeded, else ``unsolved``."""
+        for e in range(self.budget):
+            final = states[job_id(task, self.name_of(e))].get("final") or {}
+            if final.get("class") == "valid" and final.get("success"):
+                return "solved"
+        return "unsolved"
+
     def tick(self, states: Mapping[str, Mapping[str, Any]]) -> None:
         """Start, poll and apply reflections; finalize tasks that are done."""
         pending = []
@@ -650,7 +841,13 @@ class Stage3(C.Stage):
             try:
                 action = self._scan(task, states)
                 if action and action[0] == "final":
-                    self.finalize(task, states, status=action[1], last=action[2])
+                    self.finalize(
+                        task,
+                        states,
+                        status=action[1],
+                        last=action[2],
+                        reason=action[3] if len(action) > 3 else None,
+                    )
                 elif action:
                     pending.append(action[1:])
             except Exception as exc:  # noqa: BLE001 - logged; the next tick retries
@@ -681,7 +878,9 @@ class Stage3(C.Stage):
 
     def _scan(self, task: str, states: Mapping[str, Mapping[str, Any]]) -> tuple | None:
         """``("final", status, last)``, ``("reflect", task, e, state)``, or None (an episode is
-        queued or running)."""
+        queued or running); stop_rule "cross_scene": ``("final", status, last, reason)``."""
+        if self.stop_rule != "first_success":
+            return self._scan_v2(task, states)
         if self.parallel:
             return self._scan_sessions(task, states)
         for e in range(self.budget):
@@ -727,6 +926,35 @@ class Stage3(C.Stage):
                 return ("final", "solved", episodes[-1])
         return ("final", "unsolved", self.budget - 1)
 
+    def _scan_v2(
+        self, task: str, states: Mapping[str, Mapping[str, Any]]
+    ) -> tuple | None:
+        """:meth:`_scan` under stop_rule "cross_scene", both modes: episodes are reflected on in
+        order (parallel: once the whole session is final); after each session's last
+        reflection :meth:`stop_after` decides; a success alone does not stop the task."""
+        for s in range(self.sessions):
+            episodes = list(self.session_episodes(s))
+            finals = [
+                states[job_id(task, self.name_of(e))].get("final") for e in episodes
+            ]
+            if all(f and f.get("class") == "not_needed" for f in finals):
+                continue
+            if self.parallel and not all(finals):
+                return None
+            for e, final in zip(episodes, finals):
+                if not final:
+                    return None
+                if final.get("class") == "not_needed":
+                    continue
+                if final.get("class") != "valid":
+                    return ("final", "infra_exhausted", e, "infra_exhausted")
+                if not self.reflection_path(task, e).exists():
+                    return ("reflect", task, e, states[job_id(task, self.name_of(e))])
+            reason = self.stop_after(task, s, states)
+            if reason:
+                return ("final", self.solved_status(task, states), episodes[-1], reason)
+        return ("final", self.solved_status(task, states), self.budget - 1, "budget")
+
     # -- reflections ---------------------------------------------------------
 
     def final_try_dir(self, state: Mapping[str, Any]) -> Path:
@@ -754,6 +982,8 @@ class Stage3(C.Stage):
     def start_reflection(
         self, task: str, e: int, state: Mapping[str, Any], rstate: dict[str, Any]
     ) -> int:
+        if rstate.get("phase") == "fix":  # a rewrite request to (re)start (scene_free)
+            return self.start_fix_call(task, e, rstate)
         try_dir = self.final_try_dir(state)
         before = self.entries_before(task, e)
         snapshot = self.snapshot(task, e)
@@ -781,7 +1011,6 @@ class Stage3(C.Stage):
                 rstate,
             )
             return 0
-        model, effort = reflection_model(self.cfg)
         prompt = R.build_prompt(
             d,
             language=R.task_language(try_dir),
@@ -790,26 +1019,46 @@ class Stage3(C.Stage):
             termination=str(outcome.get("termination_reason") or ""),
             entries=before,
             settings=self.settings,
+            scene_free=self.scene_free,
+            frozen_verified=self.cross_scene,
         )
         folder = self.reflection_dir(task, e)
         folder.mkdir(parents=True, exist_ok=True)
         C.atomic_write_text(folder / "prompt.txt", prompt)
-        request = {
+        request = self._request(base["episode"], "prompt.txt", prompt)
+        C.atomic_write_json(folder / "request.json", request)
+        return self._launch_call(task, e, rstate, "request.json", prompt)
+
+    def _request(self, episode: str, prompt_file: str, prompt: str) -> dict[str, Any]:
+        model, effort = reflection_model(self.cfg)
+        return {
             "model": model,
             "reasoning_effort": effort,
             "max_output_tokens": int(self.refl["max_output_tokens"]),
             "timeout_s": int(self.refl["timeout_s"]),
             "empty_retries": int(self.refl["empty_retries"]),
-            "prompt_file": "prompt.txt",
+            "prompt_file": prompt_file,
             "prompt_sha256": R.prompt_sha256(prompt),
-            "episode": base["episode"],
+            "episode": episode,
         }
-        C.atomic_write_json(folder / "request.json", request)
+
+    def _launch_call(
+        self,
+        task: str,
+        e: int,
+        rstate: dict[str, Any],
+        request_name: str,
+        prompt: str,
+        *,
+        phase: str | None = None,
+    ) -> int:
+        """Start one reflection call (``reflect_call.sh REQUEST REPLY``); returns 1."""
+        folder = self.reflection_dir(task, e)
         calls = int(rstate.get("calls") or 0) + 1
         reply, log = folder / f"reply{calls}.json", folder / f"call{calls}.log"
         with log.open("w") as out:
             proc = subprocess.Popen(
-                [*self.refl["cmd"], str(folder / "request.json"), str(reply)],
+                [*self.refl["cmd"], str(folder / request_name), str(reply)],
                 env=self.reflection_env(),
                 stdin=subprocess.DEVNULL,
                 stdout=out,
@@ -826,21 +1075,101 @@ class Stage3(C.Stage):
             log=log.name,
             started_at=C.now_iso(),
             started_ts=time.time(),
-            prompt_sha256=request["prompt_sha256"],
+            prompt_sha256=R.prompt_sha256(prompt),
         )
+        if phase:
+            rstate["request"] = request_name
         C.atomic_write_json(folder / "state.json", rstate)
+        row = {
+            "event": "reflection_start",
+            "task": task,
+            "episode": self.name_of(e),
+            "call": calls,
+            "pid": proc.pid,
+            "prompt_chars": len(prompt),
+        }
+        if phase:
+            row["phase"] = phase
+        C.append_jsonl(self.layout.progress, row)
+        return 1
+
+    def _v2_kwargs(self, e: int) -> dict[str, Any]:
+        """``reflect.reviewed``'s cross-scene arguments for episode ``e`` (none when off)."""
+        return (
+            {"seed": self.seed_of(e), "cross_scene": True} if self.cross_scene else {}
+        )
+
+    def start_fix_call(self, task: str, e: int, rstate: dict[str, Any]) -> int:
+        """(Re)start the rewrite request of a reflection whose reply had scene-bound entries."""
+        folder = self.reflection_dir(task, e)
+        prompt = (folder / "prompt.txt").read_text(encoding="utf-8")
+        main = C.read_json(folder / str(rstate["main_reply"])) or {}
+        fix = R.build_fix_prompt(
+            prompt, str(main.get("text") or ""), rstate["rejections"]
+        )
+        C.atomic_write_text(folder / "fix_prompt.txt", fix)
+        request = {
+            **self._request(f"{task}/{self.name_of(e)}", "fix_prompt.txt", fix),
+            "kind": "fix",
+            # 1 for the first rewrite call, 2 after a failed one, ... (its own call budget)
+            "attempt": int(rstate.get("calls") or 0)
+            - int(rstate.get("calls_base") or 0)
+            + 1,
+        }
+        C.atomic_write_json(folder / "fix_request.json", request)
+        return self._launch_call(task, e, rstate, "fix_request.json", fix, phase="fix")
+
+    def maybe_start_fix(
+        self,
+        task: str,
+        e: int,
+        state: Mapping[str, Any],
+        rstate: dict[str, Any],
+        text: str,
+        before: list[dict[str, Any]],
+        success: bool,
+    ) -> bool:
+        """scene_free: check the reply's added and revised entries; when some are bound to the
+        scene, start the rewrite request (the same reflection's next call) and return True."""
+        try:
+            edits = R.parse_edits(text)
+        except ValueError:
+            return False  # unparsed: recorded as before
+        used = R.used_ids(before, edits, self.shown_ids(task, e))
+        frozen = (
+            R.frozen_ids(before, used, success, self.seed_of(e))
+            if self.cross_scene
+            else set()
+        )
+        rejections = R.scene_rejections(
+            edits,
+            before,
+            language=R.task_language(self.final_try_dir(state)),
+            allowed=self.allowed_numbers,
+            frozen=frozen,
+            chars=self.settings.field_chars,
+        )
+        if not rejections:
+            return False
+        rstate.update(
+            phase="fix",
+            main_reply=rstate["reply"],
+            main_prompt_sha256=rstate.get("prompt_sha256"),
+            rejections=rejections,
+            # the rewrite request has its own budget of failed calls
+            calls_base=int(rstate.get("calls") or 0),
+        )
         C.append_jsonl(
             self.layout.progress,
             {
-                "event": "reflection_start",
+                "event": "scene_rejected",
                 "task": task,
                 "episode": self.name_of(e),
-                "call": calls,
-                "pid": proc.pid,
-                "prompt_chars": len(prompt),
+                "items": [r["item"] for r in rejections],
             },
         )
-        return 1
+        self.start_fix_call(task, e, rstate)
+        return True
 
     def reflection_env(self) -> dict[str, str]:
         """The cell launchers' credential inputs (names and the file path only)."""
@@ -867,7 +1196,9 @@ class Stage3(C.Stage):
             alive = (
                 bool(pid)
                 and C.pid_alive(pid)
-                and C.cmdline_has(pid, str(folder / "request.json"))
+                and C.cmdline_has(
+                    pid, str(folder / str(rstate.get("request") or "request.json"))
+                )
             )
         if alive:
             limit = float(self.refl["timeout_s"]) + 180
@@ -895,11 +1226,15 @@ class Stage3(C.Stage):
                 for k in ("status", "latency_s", "retries", "empty_retries", "error")
             }
             | {"call": rstate.get("calls"), "usd": round(usd, 6)}
+            | ({"phase": rstate["phase"]} if rstate.get("phase") else {})
         )
         if reply.get("status") not in ("ok", "refused"):
             self.call_failed(
                 task, e, rstate, f"{reply.get('status')}: {reply.get('error')}"
             )
+            return
+        if rstate.get("phase") == "fix":
+            self.finish_fix(task, e, state, rstate, reply)
             return
         try_dir = self.final_try_dir(state)
         before = self.entries_before(task, e)
@@ -932,6 +1267,10 @@ class Stage3(C.Stage):
             }
         else:
             text = str(reply.get("text") or "")
+            if self.scene_free and self.maybe_start_fix(
+                task, e, state, rstate, text, before, success
+            ):
+                return  # the rewrite request runs; its reply completes the reflection
             done = R.reviewed(
                 before,
                 text,
@@ -939,6 +1278,7 @@ class Stage3(C.Stage):
                 success,
                 self.settings,
                 shown=self.shown_ids(task, e),
+                **self._v2_kwargs(e),
             )
             record = {
                 **base,
@@ -947,6 +1287,82 @@ class Stage3(C.Stage):
                 "reply": text,
                 "reply_sha256": R.prompt_sha256(text),
             }
+            if self.scene_free:
+                record["scene_free"] = {"rejected": [], "rewrite": None}
+        self.write_reflection(task, e, record, rstate)
+
+    def finish_fix(
+        self,
+        task: str,
+        e: int,
+        state: Mapping[str, Any],
+        rstate: dict[str, Any],
+        reply: Mapping[str, Any],
+    ) -> None:
+        """Complete a reflection after its rewrite request: the rejected items are replaced by
+        their scene-free rewrites or dropped (all dropped after a refusal), then applied."""
+        folder = self.reflection_dir(task, e)
+        main = C.read_json(folder / str(rstate["main_reply"])) or {}
+        text = str(main.get("text") or "")
+        proposed = R.parse_edits(text)
+        try_dir = self.final_try_dir(state)
+        language = R.task_language(try_dir)
+        fix_text = str(reply.get("text") or "") if reply["status"] == "ok" else ""
+        merged, outcome = R.merge_rewrites(
+            proposed,
+            rstate["rejections"],
+            R.parse_rewrites(fix_text) if reply["status"] == "ok" else None,
+            language=language,
+            allowed=self.allowed_numbers,
+            chars=self.settings.field_chars,
+        )
+        before = self.entries_before(task, e)
+        d = R.digest(try_dir, self.settings)
+        success = bool(state["final"].get("success"))
+        base = self._record_base(
+            task, e, try_dir, d, C.read_outcome(try_dir), success, before
+        )
+        call = {
+            "model": main.get("model"),
+            "reasoning_effort": main.get("reasoning_effort"),
+            "prompt_sha256": rstate.get("main_prompt_sha256"),
+            "prompt_chars": len((folder / "prompt.txt").read_text(encoding="utf-8")),
+            "usage": main.get("usage"),
+            "calls": rstate.get("calls"),
+            "latency_s": main.get("latency_s"),
+            "retries": main.get("retries"),
+            "usd": rstate["usd"],
+        }
+        done = R.reviewed(
+            before,
+            text,
+            base["episode"],
+            success,
+            self.settings,
+            shown=self.shown_ids(task, e),
+            edits=merged,
+            **self._v2_kwargs(e),
+        )
+        record = {
+            **base,
+            **call,
+            **done,
+            "reply": text,
+            "reply_sha256": R.prompt_sha256(text),
+            "edits_proposed": proposed,
+            "scene_free": {
+                "rejected": rstate["rejections"],
+                "rewrite": {
+                    "status": reply["status"],
+                    "reply": fix_text,
+                    "error": reply.get("error") if reply["status"] != "ok" else None,
+                    "usage": reply.get("usage"),
+                    "latency_s": reply.get("latency_s"),
+                    "prompt_sha256": rstate.get("prompt_sha256"),
+                    **outcome,
+                },
+            },
+        }
         self.write_reflection(task, e, record, rstate)
 
     def call_failed(self, task: str, e: int, rstate: dict[str, Any], why: str) -> None:
@@ -1027,6 +1443,8 @@ class Stage3(C.Stage):
             base["session"] = self.session_of(e) + 1
             # the ids the episode ran with (its session's memory): only these can count as used
             base["session_memory"] = [str(x["id"]) for x in self.memory_used(task, e)]
+        if self.v2:
+            base["seed"] = self.seed_of(e)
         return base
 
     def write_reflection(
@@ -1073,6 +1491,25 @@ class Stage3(C.Stage):
                     if self.parallel
                     else {}
                 ),
+                **(
+                    {
+                        "seed": record.get("seed"),
+                        "verified_now": record.get("verified_now"),
+                        "revise_ignored_verified": record.get(
+                            "revise_ignored_verified"
+                        ),
+                        "scene_rejected": [
+                            r["item"]
+                            for r in (record.get("scene_free") or {}).get("rejected")
+                            or []
+                        ],
+                        "scene_dropped": (
+                            (record.get("scene_free") or {}).get("rewrite") or {}
+                        ).get("dropped"),
+                    }
+                    if self.v2
+                    else {}
+                ),
                 "entries_before": record["entries_before"],
                 "entries_after": after,
                 "usd": record.get("usd", 0.0),
@@ -1101,8 +1538,12 @@ class Stage3(C.Stage):
         *,
         status: str,
         last: int,
+        reason: str | None = None,
     ) -> None:
-        """Mark the episodes not needed, write the kept memory and the task record."""
+        """Mark the episodes not needed, write the kept memory and the task record.
+
+        ``reason`` (stop_rule "cross_scene") is why the task stopped (``STOP_REASONS``).
+        """
         episodes, entries = [], []
         for e in range(self.budget):
             state = states[job_id(task, self.name_of(e))]
@@ -1114,7 +1555,7 @@ class Stage3(C.Stage):
                             "job_id": job_id(task, self.name_of(e)),
                             "task": task,
                             "split": self.split_of[task],
-                            "seed": self.seed,
+                            "seed": self.seed_of(e),
                             "tries": [],
                             "final": {
                                 "class": "not_needed",
@@ -1147,6 +1588,12 @@ class Stage3(C.Stage):
             "seed": self.seed,
             "history": episodes,
         }
+        if self.v2:
+            final_doc.update(
+                session_seeds=list(self.session_seeds),
+                stop_rule=self.stop_rule,
+                stop_reason=reason,
+            )
         folder = self.layout.task_dir(task)
         for name in ("final.json", "final.md"):
             if (folder / name).exists():
@@ -1189,14 +1636,17 @@ class Stage3(C.Stage):
         record["usd"]["total"] = round(
             record["usd"]["episodes"] + record["usd"]["reflections"], 4
         )
-        if self.parallel:
+        if self.parallel or self.v2:
             launched = [
                 self.session_of(e)
                 for e in range(self.budget)
                 if states[job_id(task, self.name_of(e))].get("tries")
             ]
-            record["parallel_attempts"] = True
+            if self.parallel:
+                record["parallel_attempts"] = True
             record["sessions_run"] = max(launched) + 1 if launched else 0
+        if self.v2:
+            record.update(self.v2_record(task, episodes, kept, reason))
         C.atomic_write_json(self.record_path(task), record)
         C.append_jsonl(
             self.layout.progress,
@@ -1208,6 +1658,57 @@ class Stage3(C.Stage):
                 "entries_kept": len(kept),
             },
         )
+
+    def v2_record(
+        self,
+        task: str,
+        episodes: list[dict[str, Any]],
+        kept: list[dict[str, Any]],
+        reason: str | None,
+    ) -> dict[str, Any]:
+        """The task record's stage-3 v2 fields: seeds, stop reason, checks, provenance."""
+        rejected = kept_items = dropped = 0
+        with_rejections = 0
+        for e in range(self.budget):
+            record = C.read_json(self.reflection_path(task, e))
+            if not isinstance(record, dict):
+                continue
+            sf = record.get("scene_free") or {}
+            if sf.get("rejected"):
+                with_rejections += 1
+                rejected += len(sf["rejected"])
+                kept_items += len((sf.get("rewrite") or {}).get("kept") or [])
+                dropped += len((sf.get("rewrite") or {}).get("dropped") or [])
+        valid = [h for h in episodes if h["class"] == "valid"]
+        return {
+            "session_seeds": list(self.session_seeds),
+            "seeds_run": sorted(
+                {h["seed"] for h in episodes if h.get("seed") is not None}
+            ),
+            "stop_rule": self.stop_rule,
+            "stop_reason": reason,
+            "successes": sum(1 for h in valid if h["success"]),
+            "successes_by_seed": {
+                str(s): sum(1 for h in valid if h["success"] and h.get("seed") == s)
+                for s in sorted({h.get("seed") for h in valid})
+            },
+            "scene_free": {
+                "on": self.scene_free,
+                "reflections_with_rejections": with_rejections,
+                "rejected_items": rejected,
+                "rewritten_kept": kept_items,
+                "dropped": dropped,
+            },
+            "verified": [
+                {
+                    "id": x["id"],
+                    "written_seed": x.get("written_seed"),
+                    "text_seed": x.get("text_seed"),
+                    "verified_by": x.get("verified_by"),
+                }
+                for x in kept
+            ],
+        }
 
     def _complete_history(self, task: str) -> None:
         """Add history rows for reflections a crashed runner wrote but did not log."""
@@ -1266,6 +1767,12 @@ class Stage3(C.Stage):
             "gpt_calls": 0,
             "errors_trigger": 0,
         }
+        if self.v2:
+            row["seed"] = self.seed_of(e)
+            row["scene_rejected"] = len(
+                (reflection.get("scene_free") or {}).get("rejected") or []
+            )
+            row["verified_now"] = reflection.get("verified_now") or []
         if final.get("class") == "valid":
             try_dir = self.final_try_dir(state)
             check = (
@@ -1603,7 +2110,84 @@ def chain_problems(stage: Stage3, task: str) -> list[str]:
             problems.append(
                 f"{stage.name_of(e)}: reflection.json changed after it was written"
             )
+        if stage.v2:
+            problems.extend(v2_chain_problems(stage, task, e, record, ran_with))
         previous = record.get("entries_after") or []
+    return problems
+
+
+def v2_chain_problems(
+    stage: Stage3,
+    task: str,
+    e: int,
+    record: Mapping[str, Any],
+    ran_with: list[dict[str, Any]],
+) -> list[str]:
+    """Stage 3 v2's checks of one reflection: the episode ran on its session's seed; with
+    cross-scene verification every entry verified here was in the episode's corrections file
+    as it stood (``ran_with``, the memory the snapshot renders) and applied in this successful
+    episode on another seed than its text's, and a verified entry's text never changes; with
+    scene-free entries every field the reflection added or changed passes the scene check the
+    runner applies (:func:`reflect.item_problems`, the episode's task language)."""
+    name, problems = stage.name_of(e), []
+    seed = stage.seed_of(e)
+    episode = C.read_json(stage.episode_dir(task, e) / "episode.json") or {}
+    if episode.get("seed") != seed or record.get("seed") != seed:
+        problems.append(f"{name}: not recorded on its session's seed {seed}")
+    before = {str(x["id"]): x for x in record.get("entries_before") or []}
+    after = {str(x["id"]): x for x in record.get("entries_after") or []}
+    shown = {str(x["id"]): x for x in ran_with}
+    if stage.cross_scene:
+        for i, x in after.items():
+            if x.get("status") != "verified":
+                continue
+            old = before.get(i)
+            if old is not None and old.get("status") == "verified":
+                if any(x.get(f) != old.get(f) for f in R.ENTRY_FIELDS):
+                    problems.append(f"{name}: verified entry {i} changed its text")
+                continue
+            by = x.get("verified_by") or {}
+            stood = (
+                old is not None
+                and i in shown
+                and all(
+                    shown[i].get(k) == old.get(k) for k in ("trigger", *R.ENTRY_FIELDS)
+                )
+            )
+            if (
+                not stood
+                or by.get("episode") != record.get("episode")
+                or not record.get("success")
+                or i not in set(record.get("used") or [])
+                or by.get("seed") != seed
+                or old.get("text_seed") in (None, seed)
+                or x.get("text_seed") != old.get("text_seed")
+                or {"episode": record.get("episode"), "seed": seed, "success": True}
+                not in (x.get("applied_in") or [])
+            ):
+                problems.append(
+                    f"{name}: entry {i} is verified without a success on another scene "
+                    "that was shown it as it stood"
+                )
+    if stage.scene_free and record.get("status") == "applied":
+        language = R.task_language(Path(record.get("try_dir") or ""))
+        for i, x in after.items():
+            old = before.get(i)
+            if old is None:  # added here: every field, and the trigger
+                item, add = x, True
+            else:  # revised here: the fields that changed
+                item = {f: x.get(f) for f in R.ENTRY_FIELDS if x.get(f) != old.get(f)}
+                add = False
+                if not item:
+                    continue
+            found = R.item_problems(item, language, stage.allowed_numbers, add=add)
+            if found:
+                problems.append(
+                    f"{name}: entry {i} is not scene-free: "
+                    + "; ".join(
+                        f"{p['field']} {p['rule']} ({p['match']!r})" for p in found[:2]
+                    )
+                )
     return problems
 
 
@@ -1714,11 +2298,14 @@ def freeze(
                     "first_success",
                     "entries_kept",
                     "final_md_sha256",
+                    *(("stop_reason", "sessions_run") if stage.v2 else ()),
                 )
             }
             for task, rec in records.items()
         },
     }
+    if stage.v2:
+        doc["v2"] = v2_settings(stage.cfg)
     C.atomic_write_json(product / "PRODUCT.json", doc)
     S1._make_read_only(product / "final")
     C.atomic_write_text(product / "FROZEN", tree + "\n")
@@ -1738,6 +2325,35 @@ def freeze(
 def summarize(records: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """run_ecc_stage3's ``summary.json`` fields plus the reflections, the errors trigger and cost."""
     recs = list(records.values())
+    v2 = (
+        {
+            "stop_reasons": {
+                reason: sum(1 for r in recs if r.get("stop_reason") == reason)
+                for reason in STOP_REASONS
+            },
+            "sessions_run": sum(int(r.get("sessions_run") or 0) for r in recs),
+            "scene_free": {
+                k: sum(int((r.get("scene_free") or {}).get(k) or 0) for r in recs)
+                for k in (
+                    "reflections_with_rejections",
+                    "rejected_items",
+                    "rewritten_kept",
+                    "dropped",
+                )
+            },
+        }
+        if any("stop_rule" in r for r in recs)
+        else {}
+    )
+    return {
+        **_summary(records, recs),
+        **v2,
+    }
+
+
+def _summary(
+    records: Mapping[str, Mapping[str, Any]], recs: list[Mapping[str, Any]]
+) -> dict[str, Any]:
     return {
         "tasks": len(recs),
         "solved": sum(bool(r["solved"]) for r in recs),
@@ -1765,6 +2381,37 @@ def summarize(records: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
             for split in C.SPLITS
         },
     }
+
+
+def v2_product_problems(final: Path, doc: Mapping[str, Any]) -> list[str]:
+    """A cross-scene product's provenance: every kept entry was verified by a success on a
+    session seed other than its text's seed, and ``<Task>.md`` renders exactly the kept entries."""
+    seeds = set((doc.get("v2") or {}).get("session_seeds") or [])
+    problems = []
+    for task in doc["tasks"]:
+        data = C.read_json(final / f"{task}.json") or {}
+        entries = data.get("entries") or []
+        for x in entries:
+            by = x.get("verified_by") or {}
+            if (
+                x.get("status") != "verified"
+                or by.get("seed") not in seeds
+                or x.get("text_seed") not in seeds
+                or by.get("seed") == x.get("text_seed")
+                or not any(
+                    a.get("episode") == by.get("episode")
+                    and a.get("seed") == by.get("seed")
+                    and a.get("success")
+                    for a in x.get("applied_in") or []
+                )
+            ):
+                problems.append(
+                    f"{task}: entry {x.get('id')} has no cross-scene verification"
+                )
+        md = final / f"{task}.md"
+        if md.is_file() and md.read_text(encoding="utf-8") != R.render_file(entries):
+            problems.append(f"{task}.md does not render {task}.json's entries")
+    return problems
 
 
 def verify(product: Path) -> dict[str, Any]:
@@ -1804,6 +2451,8 @@ def verify(product: Path) -> dict[str, Any]:
     ]
     if writable:
         problems.append(f"{len(writable)} final/ entries are writable")
+    if (doc.get("v2") or {}).get("cross_scene_verify"):
+        problems.extend(v2_product_problems(product / doc["final"], doc))
     return {
         "ok": not problems,
         "problems": problems,
@@ -1918,6 +2567,7 @@ def task_overview(
         if record:
             row["status"] = record["status"]
             row["verified"] = record["entries_kept"]
+            row["stop_reason"] = record.get("stop_reason")
         elif row["status"] is None:
             row["status"] = "queued"
         out[task] = row
@@ -1995,6 +2645,19 @@ def format_status(
             lines.append(
                 f"  NOTE: concurrency {limit} is below {stage.attempts}: no new session starts"
             )
+    if stage.v2:
+        reasons = [r.get("stop_reason") for r in rows.values() if r.get("stop_reason")]
+        lines.append(
+            f"  stage 3 v2: session seeds {stage.session_seeds or [stage.seed]}; scene-free entries "
+            f"{'on' if stage.scene_free else 'off'}; cross-scene verification "
+            f"{'on' if stage.cross_scene else 'off'}; stop rule {stage.stop_rule}; stopped: "
+            + (
+                ", ".join(
+                    f"{k} {reasons.count(k)}" for k in STOP_REASONS if k in reasons
+                )
+                or "none yet"
+            )
+        )
     lines.append(
         f"  cost so far (list price): episodes ${tot['usd_episodes']:.2f} + reflections "
         f"${tot['usd_reflections']:.2f} = ${tot['usd_episodes'] + tot['usd_reflections']:.2f}"
@@ -2076,6 +2739,7 @@ def make_manifest(
                 if cfg["stage3"]["parallel_attempts"]
                 else {}
             ),
+            **v2_budget(cfg),
         },
         "reflection": {
             "model": model,
@@ -2110,6 +2774,23 @@ def make_manifest(
             }
         ],
     }
+
+
+def v2_budget(cfg: Mapping[str, Any]) -> dict[str, Any]:
+    """The manifest's budget fields of stage 3 v2 (none when every switch is off)."""
+    v2 = v2_settings(cfg)
+    if all(v == V2_DEFAULTS[k] for k, v in v2.items()):
+        return {}
+    out: dict[str, Any] = {
+        "session_seeds": v2["session_seeds"] or [cfg["stage3"]["seed"]]
+    }
+    if v2["stop_rule"] == "cross_scene":
+        out["stop"] = (
+            "after the session that leaves a cross-scene-verified entry; or after "
+            f"{v2['unneeded_sessions']} sessions in a row whose every valid episode succeeded "
+            "without a GPT-6 turn; or after the last session"
+        )
+    return out
 
 
 def check_resume(
@@ -2184,19 +2865,47 @@ def print_plan(cfg: Mapping[str, Any], args: argparse.Namespace) -> int:
     print(
         f"  tasks    {len(tasks)} ({', '.join(f'{k} {v}' for k, v in by_split.items())}); seed {s3['seed']}, split {S1.SPLIT}"
     )
+    v2_stop = v2_settings(cfg)["stop_rule"] == "cross_scene"
     print(
         f"  budget   {s3['sessions']} sessions x {s3['attempts_per_session']} attempts = {budget(cfg)} "
-        f"single-shot episodes per task; stop at the first valid success; planner time "
-        f"{ {s: timeout_for(cfg, s) for s in C.SPLITS} } s, {cfg['episode']['max_turns']} turns"
+        f"single-shot episodes per task; "
+        + (
+            "stop by the stage 3 v2 rule below"
+            if v2_stop
+            else "stop at the first valid success"
+        )
+        + f"; planner time { ({s: timeout_for(cfg, s) for s in C.SPLITS}) } s, {cfg['episode']['max_turns']} turns"
     )
     if s3["parallel_attempts"]:
         print(
             f"  sessions parallel: the {s3['attempts_per_session']} attempts of a session run at once with the "
             "memory at the session's start; when all are final, their reflections run in order (a1, a2, ...), "
             "each on the memory the previous one left, and the next session starts with the result; the task "
-            "stops after the first session with a valid success (all its episodes reflected on); an applied id "
-            "counts as used only if the episode was shown it. A session starts only when all its attempts fit "
-            f"(--concurrency counts episodes: use a multiple of {s3['attempts_per_session']})"
+            + (
+                "stops after a session by the stage 3 v2 rule below"
+                if v2_stop
+                else "stops after the first session with a valid success (all its episodes reflected on)"
+            )
+            + "; an applied id counts as used only if the episode was shown it. A session starts only when all "
+            f"its attempts fit (--concurrency counts episodes: use a multiple of {s3['attempts_per_session']})"
+        )
+    v2 = v2_settings(cfg)
+    if any(v != V2_DEFAULTS[k] for k, v in v2.items()):
+        print(
+            f"  stage 3 v2: session seeds {v2['session_seeds'] or [s3['seed']]} (a session's attempts share "
+            f"its seed); scene-free entries {'on' if v2['scene_free'] else 'off'}"
+            + (
+                f" (allowed numbers {v2['scene_free_allowed_numbers']})"
+                if v2["scene_free_allowed_numbers"]
+                else ""
+            )
+            + f"; cross-scene verification {'on' if v2['cross_scene_verify'] else 'off'}; stop rule "
+            + (
+                f"cross_scene (verified entry, or {v2['unneeded_sessions']} sessions in a row all solved "
+                "without GPT-6, or the budget)"
+                if v2["stop_rule"] == "cross_scene"
+                else "first valid success"
+            )
         )
     print(
         f"  retries  infra {s3['infra_retries']}, render {s3['render_retries']} per episode (never counted, never reflected on)"
@@ -2312,9 +3021,12 @@ def build(
 def drain_limit_s(stage: Stage3) -> float:
     """How long a runner that stopped launching waits for the last reflections: one call's
     timeout plus 300 s, times the attempts of a session with parallel sessions (a session's
-    reflections run one after another)."""
+    reflections run one after another), times 2 with scene-free entries (a reflection may
+    need its rewrite request)."""
     one = float(stage.refl["timeout_s"]) + 300
-    return one * (stage.attempts if stage.parallel else 1)
+    return (
+        one * (stage.attempts if stage.parallel else 1) * (2 if stage.scene_free else 1)
+    )
 
 
 def drain_reflections(
@@ -2500,9 +3212,13 @@ def load_stage(
     if manifest is None:
         raise SystemExit(f"no run at {layout.root}")
     # The run's own mode, whatever the config says now (a resume in the other mode is refused).
-    parallel = bool((manifest.get("settings") or {}).get("parallel_attempts"))
+    settings_run = manifest.get("settings") or {}
+    parallel = bool(settings_run.get("parallel_attempts"))
     if parallel != cfg["stage3"]["parallel_attempts"]:
         cfg = {**cfg, "stage3": {**cfg["stage3"], "parallel_attempts": parallel}}
+    run_v2 = {k: settings_run.get(k, d) for k, d in V2_DEFAULTS.items()}
+    if run_v2 != v2_settings(cfg):
+        cfg = {**cfg, "stage3": {**cfg["stage3"], **copy.deepcopy(run_v2)}}
     tasks = [(t["split"], t["task"]) for t in manifest["tasks"]]
     rules = {t["task"]: H.Rule.from_json(t["rule"]) for t in manifest["tasks"]}
     return (
@@ -2593,6 +3309,7 @@ def cmd_status(cfg: dict[str, Any], args: argparse.Namespace) -> int:
                 f"valid {r['valid']:>2}  rule {'gpt' if rule['gpt_plan'] else 'qwen'}/K{rule['checkin_K']}/N{rule['errors_N']}  "
                 f"refl {r['applied']}a/{r['skipped']}s/{r['unparsed']}u  entries {r['entries']} ({r['verified']} verified)  "
                 f"errors-trigger {r['errors_trigger']}  ${r['usd_episodes'] + r['usd_reflections']:.2f}"
+                + (f"  stop {r.get('stop_reason') or '-'}" if stage.v2 else "")
             )
     return 0
 
@@ -2692,6 +3409,7 @@ def cmd_reflect_only(cfg: dict[str, Any] | None, args: argparse.Namespace) -> in
     )
     rule = json.loads(args.rule) if args.rule else {"note": "dry run"}
     s = settings(cfg) if cfg else R.Settings()
+    v2 = v2_settings(cfg) if cfg else dict(V2_DEFAULTS)
     d = R.digest(out, s)
     outcome = C.read_outcome(out)
     prompt = R.build_prompt(
@@ -2702,6 +3420,8 @@ def cmd_reflect_only(cfg: dict[str, Any] | None, args: argparse.Namespace) -> in
         termination=str(outcome.get("termination_reason") or ""),
         entries=entries,
         settings=s,
+        scene_free=bool(v2["scene_free"]),
+        frozen_verified=bool(v2["cross_scene_verify"]),
     )
     print(
         json.dumps(
